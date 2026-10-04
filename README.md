@@ -59,24 +59,18 @@ python setup-agent.py
 
 ## Switching models in-session
 
-The built-in `/model` picker slots are re-pointed at your gateway via Claude Code's
-`modelOverrides` setting, so you can switch models **without restarting**:
+The installer fetches your gateway's model list (`/v1/models`) and writes it to Claude Code's
+`availableModels` setting. The `/model` picker then lists **your gateway's models by name**
+(the built-in Anthropic entries drop out), and you switch between them **without restarting** —
+just `/model` → pick any (gemini, claude, gpt, …).
 
-| `/model` slot | goes to (default) |
-|---|---|
-| **Opus**   | `<model>-high`   |
-| **Sonnet** | your default model |
-| **Haiku**  | `<model>-low`    |
-
-Any other model: `/model → Custom → ` type the id (see `<gateway>/v1/models`).
-
-Change the slot→model mapping anytime in `~/.clirelay-agent/claude-home/settings.json`
-(the `modelOverrides` object).
+Edit the list anytime in `~/.clirelay-agent/claude-home/settings.json` (the `availableModels`
+array); change the default with the `model` field.
 
 > ## Смена модели (RU)
-> Переключение прямо в сессии командой **`/model`**: Opus → `-high`, Sonnet → дефолт,
-> Haiku → `-low`. Любая другая — `/model → Custom`. Привязки слотов меняются в
-> `~/.clirelay-agent/claude-home/settings.json` (`modelOverrides`).
+> В пикере **`/model`** — модели твоего шлюза по именам (встроенные Anthropic убраны).
+> Переключение прямо в сессии: `/model` → выбрать любую. Список/дефолт правятся в
+> `~/.clirelay-agent/claude-home/settings.json` (`availableModels` / `model`).
 
 ## Удаление
 

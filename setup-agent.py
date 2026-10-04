@@ -243,29 +243,21 @@ def pick_default_model(models):
         if "flash" in m and "gemini" in m: return m
     return models[0] if models else "gemini-3.8-flash-medium"
 
-# Встроенные слоты пикера Claude Code -> переопределяем на модели шлюза (/model в сессии).
-OPUS_IDS   = ["claude-opus-5", "claude-opus-4-8", "claude-opus-4-6", "claude-opus-4-5", "claude-opus-4-1", "claude-opus-4"]
-SONNET_IDS = ["claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-4"]
-HAIKU_IDS  = ["claude-haiku-4-5", "claude-haiku-4", "claude-haiku-3-5"]
-
-def model_slots(default_model, models):
+def low_variant(default_model, models):
+    """Лёгкая модель для фоновых задач (ANTHROPIC_SMALL_FAST_MODEL)."""
     base = default_model
     for suf in ("-high", "-medium", "-low", "-tiered", "-extra-low"):
         if base.endswith(suf): base = base[: -len(suf)]; break
-    def var(suf, fb):
-        c = base + suf
-        return c if (not models or c in models) else fb
-    high = var("-high", default_model)
-    low  = var("-low", default_model)
-    return high, default_model, low   # Opus=high, Sonnet=default, Haiku=low
+    c = base + "-low"
+    return c if (models and c in models) else default_model
 
 def build_settings(default_model, models):
-    high, med, low = model_slots(default_model, models)
-    ov = {}
-    for i in OPUS_IDS:   ov[i] = high
-    for i in SONNET_IDS: ov[i] = med
-    for i in HAIKU_IDS:  ov[i] = low
-    return {"model": "claude-sonnet-5", "modelOverrides": ov}, (high, med, low)
+    """availableModels наполняет пикер /model моделями шлюза (по именам);
+    встроенные Anthropic-модели при этом из списка уходят. Переключение — /model в сессии."""
+    s = {"model": default_model}
+    if models:
+        s["availableModels"] = sorted(models)
+    return s
 
 def write(path: Path, text: str, executable=False):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -343,10 +335,10 @@ def do_install():
     (HOME / "claude-home").mkdir(exist_ok=True)
     log_path = str(HOME / "relay-proxy.log")
 
-    # settings.json: встроенные слоты пикера -> модели шлюза (переключение /model в сессии)
-    settings, (m_high, m_med, m_low) = build_settings(model, models)
-    write(HOME / "claude-home" / "settings.json", json.dumps(settings, indent=2))
-    small = m_low
+    # settings.json: availableModels наполняет /model моделями шлюза; дефолт = выбранная модель
+    settings = build_settings(model, models)
+    write(HOME / "claude-home" / "settings.json", json.dumps(settings, indent=2, ensure_ascii=False))
+    small = low_variant(model, models)
 
     proxy_src = (PROXY_PY
                  .replace("__HOST__", host)
@@ -377,12 +369,9 @@ def do_install():
     print(f"  Лог ошибок шлюза (тихий прокси пишет сюда): {HOME / 'relay-proxy.log'}")
     print("  Правый клик по папке ->", MENU_LABEL, "-> Claude Code стартует в ней с --dangerously-skip-permissions.")
     print("  Прокси работает ТИХО, без окна, один на все сессии (сколько бы папок ни открыл).")
-    print("\n  Переключение модели ПРЯМО В СЕССИИ — команда /model (слоты уже привязаны к шлюзу):")
-    print(f"      Opus   -> {m_high}")
-    print(f"      Sonnet -> {m_med}   (по умолчанию)")
-    print(f"      Haiku  -> {m_low}")
-    print("      Любая другая модель: /model -> Custom -> впиши id из", base + "/v1/models")
-    print("  Поменять привязки слотов:", HOME / "claude-home" / "settings.json", "(ключ modelOverrides).")
+    print(f"\n  В пикере /model — все {len(models) or '?'} моделей шлюза по именам (встроенные Anthropic убраны).")
+    print(f"  Дефолт: {model}. Переключение прямо в сессии: /model -> выбрать любую (gemini/claude/gpt...).")
+    print("  Список моделей правится в", HOME / "claude-home" / "settings.json", "(ключ availableModels).")
     print("  Удалить всё:  python setup-agent.py --uninstall")
     return 0
 
