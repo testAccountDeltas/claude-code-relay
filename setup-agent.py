@@ -138,8 +138,8 @@ set "CLAUDE_CODE_SIMPLE=1"
 set "CLAUDE_CONFIG_DIR=%AGENT_HOME%\claude-home"
 set "ANTHROPIC_BASE_URL=http://127.0.0.1:{PORT}"
 set "ANTHROPIC_API_KEY={KEY}"
-set "ANTHROPIC_MODEL={MODEL}"
-set "ANTHROPIC_SMALL_FAST_MODEL={MODEL}"
+REM Модель задаётся через settings.json (+ modelOverrides) — переключается в сессии: /model
+set "ANTHROPIC_SMALL_FAST_MODEL={SMALL}"
 set "CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192"
 set "CLAUDE_CODE_MAX_CONTEXT_TOKENS=524288"
 set "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
@@ -155,8 +155,8 @@ export CLAUDE_CODE_SIMPLE=1
 export CLAUDE_CONFIG_DIR="$AGENT_HOME/claude-home"
 export ANTHROPIC_BASE_URL="http://127.0.0.1:{PORT}"
 export ANTHROPIC_API_KEY="{KEY}"
-export ANTHROPIC_MODEL="{MODEL}"
-export ANTHROPIC_SMALL_FAST_MODEL="{MODEL}"
+# Модель задаётся через settings.json (+ modelOverrides) — переключается в сессии: /model
+export ANTHROPIC_SMALL_FAST_MODEL="{SMALL}"
 export CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192
 export CLAUDE_CODE_MAX_CONTEXT_TOKENS=524288
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
@@ -243,6 +243,30 @@ def pick_default_model(models):
         if "flash" in m and "gemini" in m: return m
     return models[0] if models else "gemini-3.8-flash-medium"
 
+# Встроенные слоты пикера Claude Code -> переопределяем на модели шлюза (/model в сессии).
+OPUS_IDS   = ["claude-opus-5", "claude-opus-4-8", "claude-opus-4-6", "claude-opus-4-5", "claude-opus-4-1", "claude-opus-4"]
+SONNET_IDS = ["claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-4"]
+HAIKU_IDS  = ["claude-haiku-4-5", "claude-haiku-4", "claude-haiku-3-5"]
+
+def model_slots(default_model, models):
+    base = default_model
+    for suf in ("-high", "-medium", "-low", "-tiered", "-extra-low"):
+        if base.endswith(suf): base = base[: -len(suf)]; break
+    def var(suf, fb):
+        c = base + suf
+        return c if (not models or c in models) else fb
+    high = var("-high", default_model)
+    low  = var("-low", default_model)
+    return high, default_model, low   # Opus=high, Sonnet=default, Haiku=low
+
+def build_settings(default_model, models):
+    high, med, low = model_slots(default_model, models)
+    ov = {}
+    for i in OPUS_IDS:   ov[i] = high
+    for i in SONNET_IDS: ov[i] = med
+    for i in HAIKU_IDS:  ov[i] = low
+    return {"model": "claude-sonnet-5", "modelOverrides": ov}, (high, med, low)
+
 def write(path: Path, text: str, executable=False):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -319,6 +343,11 @@ def do_install():
     (HOME / "claude-home").mkdir(exist_ok=True)
     log_path = str(HOME / "relay-proxy.log")
 
+    # settings.json: встроенные слоты пикера -> модели шлюза (переключение /model в сессии)
+    settings, (m_high, m_med, m_low) = build_settings(model, models)
+    write(HOME / "claude-home" / "settings.json", json.dumps(settings, indent=2))
+    small = m_low
+
     proxy_src = (PROXY_PY
                  .replace("__HOST__", host)
                  .replace("__PORT_UP__", str(port))
@@ -333,11 +362,11 @@ def do_install():
     pyexe = sys.executable
     if os.name == "nt":
         launcher = HOME / "launch.cmd"
-        write(launcher, LAUNCH_CMD.replace("{PYTHON}", pyexe).replace("{PORT}", str(PROXY_PORT)).replace("{KEY}", key).replace("{MODEL}", model))
+        write(launcher, LAUNCH_CMD.replace("{PYTHON}", pyexe).replace("{PORT}", str(PROXY_PORT)).replace("{KEY}", key).replace("{SMALL}", small))
         install_menu_windows(launcher)
     else:
         launcher = HOME / "launch.command"
-        write(launcher, LAUNCH_SH.replace("{PYTHON}", pyexe).replace("{PORT}", str(PROXY_PORT)).replace("{KEY}", key).replace("{MODEL}", model), executable=True)
+        write(launcher, LAUNCH_SH.replace("{PYTHON}", pyexe).replace("{PORT}", str(PROXY_PORT)).replace("{KEY}", key).replace("{SMALL}", small), executable=True)
         try: os.chmod(HOME / "config.json", 0o600)
         except Exception: pass
         install_menu_macos()
@@ -348,7 +377,12 @@ def do_install():
     print(f"  Лог ошибок шлюза (тихий прокси пишет сюда): {HOME / 'relay-proxy.log'}")
     print("  Правый клик по папке ->", MENU_LABEL, "-> Claude Code стартует в ней с --dangerously-skip-permissions.")
     print("  Прокси работает ТИХО, без окна, один на все сессии (сколько бы папок ни открыл).")
-    print("  Сменить модель: отредактируй ANTHROPIC_MODEL в", launcher, "(или /model в TUI).")
+    print("\n  Переключение модели ПРЯМО В СЕССИИ — команда /model (слоты уже привязаны к шлюзу):")
+    print(f"      Opus   -> {m_high}")
+    print(f"      Sonnet -> {m_med}   (по умолчанию)")
+    print(f"      Haiku  -> {m_low}")
+    print("      Любая другая модель: /model -> Custom -> впиши id из", base + "/v1/models")
+    print("  Поменять привязки слотов:", HOME / "claude-home" / "settings.json", "(ключ modelOverrides).")
     print("  Удалить всё:  python setup-agent.py --uninstall")
     return 0
 

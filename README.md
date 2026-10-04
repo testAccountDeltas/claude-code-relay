@@ -57,10 +57,26 @@ python setup-agent.py
 ~/.clirelay-agent/relay-proxy.log
 ```
 
-## Смена модели
+## Switching models in-session
 
-Отредактируй `ANTHROPIC_MODEL` в `~/.clirelay-agent/launch.cmd` (Windows) /
-`launch.command` (macOS), либо прямо в TUI командой `/model → Custom`.
+The built-in `/model` picker slots are re-pointed at your gateway via Claude Code's
+`modelOverrides` setting, so you can switch models **without restarting**:
+
+| `/model` slot | goes to (default) |
+|---|---|
+| **Opus**   | `<model>-high`   |
+| **Sonnet** | your default model |
+| **Haiku**  | `<model>-low`    |
+
+Any other model: `/model → Custom → ` type the id (see `<gateway>/v1/models`).
+
+Change the slot→model mapping anytime in `~/.clirelay-agent/claude-home/settings.json`
+(the `modelOverrides` object).
+
+> ## Смена модели (RU)
+> Переключение прямо в сессии командой **`/model`**: Opus → `-high`, Sonnet → дефолт,
+> Haiku → `-low`. Любая другая — `/model → Custom`. Привязки слотов меняются в
+> `~/.clirelay-agent/claude-home/settings.json` (`modelOverrides`).
 
 ## Удаление
 
