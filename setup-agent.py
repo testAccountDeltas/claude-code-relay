@@ -58,34 +58,67 @@ def scrub(body):
         j["system"] = "\n".join(l for l in sysv.splitlines() if MARK not in l); changed = True
     return (json.dumps(j).encode("utf-8"), True) if changed else (body, False)
 
-def upstream(method, path, body, headers):
-    conn = (http.client.HTTPSConnection if USE_HTTPS else http.client.HTTPConnection)(UPSTREAM_HOST, UPSTREAM_PORT, timeout=120)
-    fh = {k: v for k, v in headers.items() if k.lower() not in ("host","content-length","accept-encoding")}
-    fh["Host"] = UPSTREAM_HOST
-    conn.request(method, path, body=body, headers=fh)
-    r = conn.getresponse(); rb = r.read()
-    hdrs = [(k, v) for k, v in r.getheaders() if k.lower() not in ("transfer-encoding","connection","content-length","content-encoding")]
-    return r.status, r.reason, hdrs, rb
+HOP = ("transfer-encoding", "connection", "content-length", "content-encoding")
+
+def _conn():
+    cls = http.client.HTTPSConnection if USE_HTTPS else http.client.HTTPConnection
+    return cls(UPSTREAM_HOST, UPSTREAM_PORT, timeout=600)
 
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def _h(self):
         n = int(self.headers.get("Content-Length") or 0)
-        body = self.rfile.read(n) if n else b""
-        body, scrubbed = scrub(body)
-        status = reason = None; hdrs = []; rbody = b""
+        body, _ = scrub(self.rfile.read(n) if n else b"")
+        fh = {k: v for k, v in self.headers.items() if k.lower() not in ("host","content-length","accept-encoding")}
+        fh["Host"] = UPSTREAM_HOST
+        conn = resp = None
         for attempt in range(1, 4):
-            try: status, reason, hdrs, rbody = upstream(self.command, self.path, body, self.headers)
-            except Exception as e: status, reason, hdrs, rbody = 502, "Bad Gateway", [], str(e).encode(); break
-            if status not in (429, 503): break
-            time.sleep(3)
-        if status != 200:
-            log("%s %s -> %s %s : %s" % (time.strftime("%H:%M:%S"), self.path, status, reason, rbody[:180].decode(errors="replace")))
-        self.send_response(status)
-        for k, v in hdrs: self.send_header(k, v)
-        self.send_header("Content-Length", str(len(rbody))); self.end_headers()
-        try: self.wfile.write(rbody)
-        except Exception: pass
+            try:
+                conn = _conn(); conn.request(self.command, self.path, body=body, headers=fh); resp = conn.getresponse()
+            except Exception as e:
+                log("%s %s -> conn err: %r" % (time.strftime("%H:%M:%S"), self.path, e))
+                try: self.send_error(502, "upstream error")
+                except Exception: pass
+                try: conn.close()
+                except Exception: pass
+                return
+            if resp.status in (429, 503) and attempt < 3:
+                try: resp.read()
+                except Exception: pass
+                conn.close(); time.sleep(3); continue
+            break
+        ctype = resp.getheader("content-type") or ""
+        if "event-stream" in ctype and resp.status == 200:
+            # ПОТОКОВАЯ передача SSE по мере поступления (иначе длинная генерация -> таймаут)
+            self.send_response(200)
+            for k, v in resp.getheaders():
+                if k.lower() not in HOP: self.send_header(k, v)
+            self.send_header("Connection", "close"); self.end_headers()
+            self.close_connection = True
+            try:
+                while True:
+                    chunk = resp.read(8192)
+                    if not chunk: break
+                    self.wfile.write(chunk); self.wfile.flush()
+            except Exception as e:
+                log("%s stream err: %r" % (time.strftime("%H:%M:%S"), e))
+            finally:
+                try: conn.close()
+                except Exception: pass
+        else:
+            try: rb = resp.read()
+            except Exception as e:
+                log("%s read err: %r" % (time.strftime("%H:%M:%S"), e)); rb = b""
+            if resp.status != 200:
+                log("%s %s -> %s %s : %s" % (time.strftime("%H:%M:%S"), self.path, resp.status, resp.reason, rb[:180].decode(errors="replace")))
+            self.send_response(resp.status)
+            for k, v in resp.getheaders():
+                if k.lower() not in HOP: self.send_header(k, v)
+            self.send_header("Content-Length", str(len(rb))); self.end_headers()
+            try: self.wfile.write(rb)
+            except Exception: pass
+            try: conn.close()
+            except Exception: pass
     do_POST = _h; do_GET = _h; do_PUT = _h
     def log_message(self, *a): pass
 
