@@ -243,21 +243,46 @@ def pick_default_model(models):
         if "flash" in m and "gemini" in m: return m
     return models[0] if models else "gemini-3.8-flash-medium"
 
-def low_variant(default_model, models):
-    """Лёгкая модель для фоновых задач (ANTHROPIC_SMALL_FAST_MODEL)."""
+def model_slots(default_model, models):
+    """Три слота пикатора: Opus=high, Sonnet=default, Haiku=low (по варианту суффикса)."""
     base = default_model
     for suf in ("-high", "-medium", "-low", "-tiered", "-extra-low"):
         if base.endswith(suf): base = base[: -len(suf)]; break
-    c = base + "-low"
-    return c if (models and c in models) else default_model
+    def var(suf, fb):
+        c = base + suf
+        return c if (not models or c in models) else fb
+    return var("-high", default_model), default_model, var("-low", default_model)
+
+def pick_extra(models, used):
+    """Доп. именованный пункт (ANTHROPIC_CUSTOM_MODEL_OPTION): предпочитаем pro-модель."""
+    for m in (models or []):
+        if m not in used and "pro" in m: return m
+    for m in (models or []):
+        if m not in used: return m
+    return None
 
 def build_settings(default_model, models):
-    """availableModels наполняет пикер /model моделями шлюза (по именам);
-    встроенные Anthropic-модели при этом из списка уходят. Переключение — /model в сессии."""
-    s = {"model": default_model}
-    if models:
-        s["availableModels"] = sorted(models)
-    return s
+    """Переопределяем встроенные слоты пикера на модели шлюза через env —
+    в /model они показываются ПО ИМЕНИ (gemini-...), переключаются в сессии.
+    (способ через ANTHROPIC_DEFAULT_*_MODEL + ANTHROPIC_CUSTOM_MODEL_OPTION)."""
+    high, med, low = model_slots(default_model, models)
+    env = {
+        "ANTHROPIC_DEFAULT_OPUS_MODEL":   high,   # слот Opus   -> high
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": med,    # слот Sonnet -> default
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL":  low,    # слот Haiku  -> low
+    }
+    extra = pick_extra(models, {high, med, low})
+    if extra:
+        env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = extra
+        env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] = extra
+        env["ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION"] = extra
+    s = {
+        "env": env,
+        "model": "sonnet",                 # дефолт -> слот Sonnet (= default model)
+        "fallbackModel": [low],            # запасная, если основная недоступна
+        "skipDangerousModePermissionPrompt": True,
+    }
+    return s, (high, med, low, extra)
 
 def write(path: Path, text: str, executable=False):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -335,10 +360,10 @@ def do_install():
     (HOME / "claude-home").mkdir(exist_ok=True)
     log_path = str(HOME / "relay-proxy.log")
 
-    # settings.json: availableModels наполняет /model моделями шлюза; дефолт = выбранная модель
-    settings = build_settings(model, models)
+    # settings.json: слоты пикера -> модели шлюза по именам (переключение /model в сессии)
+    settings, (m_high, m_med, m_low, m_extra) = build_settings(model, models)
     write(HOME / "claude-home" / "settings.json", json.dumps(settings, indent=2, ensure_ascii=False))
-    small = low_variant(model, models)
+    small = m_low
 
     proxy_src = (PROXY_PY
                  .replace("__HOST__", host)
@@ -369,9 +394,13 @@ def do_install():
     print(f"  Лог ошибок шлюза (тихий прокси пишет сюда): {HOME / 'relay-proxy.log'}")
     print("  Правый клик по папке ->", MENU_LABEL, "-> Claude Code стартует в ней с --dangerously-skip-permissions.")
     print("  Прокси работает ТИХО, без окна, один на все сессии (сколько бы папок ни открыл).")
-    print(f"\n  В пикере /model — все {len(models) or '?'} моделей шлюза по именам (встроенные Anthropic убраны).")
-    print(f"  Дефолт: {model}. Переключение прямо в сессии: /model -> выбрать любую (gemini/claude/gpt...).")
-    print("  Список моделей правится в", HOME / "claude-home" / "settings.json", "(ключ availableModels).")
+    print("\n  Модели в пикере /model (по именам, переключение прямо в сессии):")
+    print(f"      Opus   -> {m_high}")
+    print(f"      Sonnet -> {m_med}   (дефолт)")
+    print(f"      Haiku  -> {m_low}")
+    if m_extra: print(f"      +доп.  -> {m_extra}")
+    print("      Любая другая: /model -> Custom -> впиши id из", base + "/v1/models")
+    print("  Поменять привязки:", HOME / "claude-home" / "settings.json", "(блок env: ANTHROPIC_DEFAULT_*_MODEL).")
     print("  Удалить всё:  python setup-agent.py --uninstall")
     return 0
 
