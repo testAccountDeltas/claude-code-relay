@@ -141,7 +141,7 @@ set "ANTHROPIC_API_KEY={KEY}"
 REM Модель задаётся через settings.json (+ modelOverrides) — переключается в сессии: /model
 set "ANTHROPIC_SMALL_FAST_MODEL={SMALL}"
 set "CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192"
-set "CLAUDE_CODE_MAX_CONTEXT_TOKENS=524288"
+set "CLAUDE_CODE_MAX_CONTEXT_TOKENS={CTX}"
 set "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
 set "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1"
 if not "%~1"=="" cd /d "%~1"
@@ -158,7 +158,7 @@ export ANTHROPIC_API_KEY="{KEY}"
 # Модель задаётся через settings.json (+ modelOverrides) — переключается в сессии: /model
 export ANTHROPIC_SMALL_FAST_MODEL="{SMALL}"
 export CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192
-export CLAUDE_CODE_MAX_CONTEXT_TOKENS=524288
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS={CTX}
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1
 TARGET="$1"
@@ -228,13 +228,19 @@ def ask(prompt, default=None):
     return s or (default or "")
 
 def fetch_models(base, key):
+    """-> (список id, {id: реальное контекстное окно})."""
     try:
         req = urllib.request.Request(base.rstrip("/") + "/v1/models",
                                      headers={"Authorization": f"Bearer {key}"})
         d = json.loads(urllib.request.urlopen(req, timeout=20).read())
-        return [m["id"] for m in d.get("data", [])]
+        ids, wins = [], {}
+        for m in d.get("data", []):
+            ids.append(m["id"])
+            w = m.get("context_window") or m.get("max_context_window") or m.get("max_input_tokens")
+            if w: wins[m["id"]] = int(w)
+        return ids, wins
     except Exception:
-        return []
+        return [], {}
 
 def pick_default_model(models):
     for pref in ("gemini-3.8-flash-medium", "gemini-3.8-flash-low"):
@@ -347,7 +353,7 @@ def do_install():
     base = f"{'https' if use_https else 'http'}://{host}:{port}"
 
     print("\n  Получаю список моделей...")
-    models = fetch_models(base, key)
+    models, windows = fetch_models(base, key)
     model = pick_default_model(models)
     if models:
         print(f"  Найдено моделей: {len(models)}. Модель по умолчанию: {model}")
@@ -376,14 +382,15 @@ def do_install():
     write(HOME / "config.json", json.dumps(
         {"url": base, "model": model, "proxy_port": PROXY_PORT}, indent=2, ensure_ascii=False))
 
+    ctx = str(windows.get(model) or 200000)   # реальное окно модели из /v1/models
     pyexe = sys.executable
     if os.name == "nt":
         launcher = HOME / "launch.cmd"
-        write(launcher, LAUNCH_CMD.replace("{PYTHON}", pyexe).replace("{PORT}", str(PROXY_PORT)).replace("{KEY}", key).replace("{SMALL}", small))
+        write(launcher, LAUNCH_CMD.replace("{PYTHON}", pyexe).replace("{PORT}", str(PROXY_PORT)).replace("{KEY}", key).replace("{SMALL}", small).replace("{CTX}", ctx))
         install_menu_windows(launcher)
     else:
         launcher = HOME / "launch.command"
-        write(launcher, LAUNCH_SH.replace("{PYTHON}", pyexe).replace("{PORT}", str(PROXY_PORT)).replace("{KEY}", key).replace("{SMALL}", small), executable=True)
+        write(launcher, LAUNCH_SH.replace("{PYTHON}", pyexe).replace("{PORT}", str(PROXY_PORT)).replace("{KEY}", key).replace("{SMALL}", small).replace("{CTX}", ctx), executable=True)
         try: os.chmod(HOME / "config.json", 0o600)
         except Exception: pass
         install_menu_macos()
