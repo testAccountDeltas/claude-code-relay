@@ -32,7 +32,7 @@ PROXY_PY = r'''#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Фикс-прокси: Claude Code -> сюда -> шлюз. Вырезает system-блок
 # "x-anthropic-billing-header", на котором Gemini-путь шлюза отдаёт 429/503.
-# Работает тихо (без окна), один на все сессии. Пишет ТОЛЬКО ошибки в лог.
+# Стримит SSE, логирует запросы/ответы и отслеживает аномалии (thinking без текста).
 import http.server, http.client, json, time, sys, os
 
 UPSTREAM_HOST = "__HOST__"
@@ -41,6 +41,7 @@ USE_HTTPS     = __HTTPS__
 PORT          = __PORT__
 LOG           = r"__LOG__"
 MARK          = "x-anthropic-billing-header"
+HOP           = ("transfer-encoding", "connection", "content-length", "content-encoding")
 
 def log(s):
     try:
@@ -58,59 +59,162 @@ def scrub(body):
         j["system"] = "\n".join(l for l in sysv.splitlines() if MARK not in l); changed = True
     return (json.dumps(j).encode("utf-8"), True) if changed else (body, False)
 
-HOP = ("transfer-encoding", "connection", "content-length", "content-encoding")
+def summarize_req(body):
+    try:
+        j = json.loads(body)
+        model = j.get("model", "?")
+        stream = j.get("stream", False)
+        msgs = j.get("messages", [])
+        m_cnt = len(msgs)
+        max_tok = j.get("max_tokens")
+        thinking = j.get("thinking")
+        th_s = ""
+        if isinstance(thinking, dict):
+            th_s = f" th={thinking.get('type')}:{thinking.get('budget_tokens')}"
+        return f"model={model} msgs={m_cnt} stream={stream} max_tok={max_tok}{th_s}"
+    except Exception:
+        return f"raw_len={len(body)}"
+
+class SSETracker:
+    def __init__(self):
+        self.buf = ""
+        self.block_types = []
+        self.text_chars = 0
+        self.thinking_chars = 0
+        self.tools = []
+        self.stop_reason = None
+        self.usage = None
+        self.event_count = 0
+        self.errors = []
+
+    def feed(self, chunk_bytes):
+        self.buf += chunk_bytes.decode("utf-8", errors="replace")
+        while "\n" in self.buf:
+            line, self.buf = self.buf.split("\n", 1)
+            line = line.strip()
+            if not line.startswith("data:"): continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]": continue
+            self.event_count += 1
+            try:
+                ev = json.loads(payload)
+                t = ev.get("type")
+                if t == "content_block_start":
+                    cb = ev.get("content_block", {})
+                    btype = cb.get("type")
+                    self.block_types.append(btype)
+                    if btype == "tool_use": self.tools.append(cb.get("name"))
+                elif t == "content_block_delta":
+                    d = ev.get("delta", {})
+                    dtype = d.get("type")
+                    if dtype == "text_delta": self.text_chars += len(d.get("text", ""))
+                    elif dtype == "thinking_delta": self.thinking_chars += len(d.get("thinking", ""))
+                elif t == "message_delta":
+                    d = ev.get("delta", {})
+                    if "stop_reason" in d: self.stop_reason = d.get("stop_reason")
+                    if "usage" in ev: self.usage = ev.get("usage")
+                elif t == "error":
+                    self.errors.append(str(ev.get("error")))
+            except Exception: pass
+
+    def summary(self):
+        parts = []
+        if self.thinking_chars: parts.append(f"thinking={self.thinking_chars}c")
+        if self.text_chars: parts.append(f"text={self.text_chars}c")
+        if self.tools: parts.append(f"tools={','.join(str(t) for t in self.tools)}")
+        if self.stop_reason: parts.append(f"stop={self.stop_reason}")
+        if self.usage and self.usage.get("output_tokens") is not None:
+            parts.append(f"out_tok={self.usage.get('output_tokens')}")
+        if self.errors: parts.append(f"errs={self.errors}")
+        res = " ".join(parts) if parts else "no_blocks"
+        if self.thinking_chars > 0 and self.text_chars == 0 and not self.tools and self.stop_reason == "end_turn":
+            res += " [!!! EMPTY_VISIBLE_OUTPUT: thinking-only, 0 text, end_turn !!!]"
+        return res
 
 def _conn():
     cls = http.client.HTTPSConnection if USE_HTTPS else http.client.HTTPConnection
     return cls(UPSTREAM_HOST, UPSTREAM_PORT, timeout=600)
 
+_req_id = 0
+
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def _h(self):
+        global _req_id
+        _req_id += 1
+        rid = _req_id
+        t0 = time.time()
+        ts = time.strftime("%H:%M:%S")
+
         n = int(self.headers.get("Content-Length") or 0)
-        body, _ = scrub(self.rfile.read(n) if n else b"")
+        raw_body = self.rfile.read(n) if n else b""
+        body, scrubbed = scrub(raw_body)
+        meta = summarize_req(body) if "/v1/messages" in self.path else f"bytes={n}"
+        log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}) {meta}")
+
         fh = {k: v for k, v in self.headers.items() if k.lower() not in ("host","content-length","accept-encoding")}
         fh["Host"] = UPSTREAM_HOST
         conn = resp = None
         for attempt in range(1, 4):
             try:
-                conn = _conn(); conn.request(self.command, self.path, body=body, headers=fh); resp = conn.getresponse()
+                conn = _conn()
+                conn.request(self.command, self.path, body=body, headers=fh)
+                resp = conn.getresponse()
             except Exception as e:
-                log("%s %s -> conn err: %r" % (time.strftime("%H:%M:%S"), self.path, e))
+                dur = time.time() - t0
+                log(f"[{time.strftime('%H:%M:%S')}] #{rid} !! conn err after {dur:.1f}s (att {attempt}): {e!r}")
                 try: self.send_error(502, "upstream error")
                 except Exception: pass
                 try: conn.close()
                 except Exception: pass
                 return
             if resp.status in (429, 503) and attempt < 3:
-                try: resp.read()
+                try:
+                    rb = resp.read()
+                    log(f"[{time.strftime('%H:%M:%S')}] #{rid} -- attempt {attempt} -> {resp.status} {resp.reason} ({rb[:120].decode(errors='replace')}), retry in 3s")
                 except Exception: pass
                 conn.close(); time.sleep(3); continue
             break
+
         ctype = resp.getheader("content-type") or ""
         if "event-stream" in ctype and resp.status == 200:
-            # ПОТОКОВАЯ передача SSE по мере поступления (иначе длинная генерация -> таймаут)
+            # ПОТОКОВАЯ передача SSE по мере поступления
             self.send_response(200)
             for k, v in resp.getheaders():
                 if k.lower() not in HOP: self.send_header(k, v)
             self.send_header("Connection", "close"); self.end_headers()
             self.close_connection = True
+            tracker = SSETracker()
+            total_bytes = chunks = 0
+            stream_err = None
             try:
                 while True:
                     chunk = resp.read(8192)
                     if not chunk: break
+                    total_bytes += len(chunk); chunks += 1
+                    tracker.feed(chunk)
                     self.wfile.write(chunk); self.wfile.flush()
             except Exception as e:
-                log("%s stream err: %r" % (time.strftime("%H:%M:%S"), e))
+                stream_err = e
             finally:
                 try: conn.close()
                 except Exception: pass
+            dur = time.time() - t0
+            summary = tracker.summary()
+            if stream_err:
+                log(f"[{time.strftime('%H:%M:%S')}] #{rid} << SSE BROKEN ({dur:.1f}s, {total_bytes}B, {chunks} chunks): err={stream_err!r} | {summary}")
+            else:
+                log(f"[{time.strftime('%H:%M:%S')}] #{rid} << SSE 200 OK ({dur:.1f}s, {total_bytes}B, {chunks} chunks): {summary}")
         else:
             try: rb = resp.read()
             except Exception as e:
-                log("%s read err: %r" % (time.strftime("%H:%M:%S"), e)); rb = b""
+                dur = time.time() - t0
+                log(f"[{time.strftime('%H:%M:%S')}] #{rid} !! read err after {dur:.1f}s: {e!r}"); rb = b""
+            dur = time.time() - t0
             if resp.status != 200:
-                log("%s %s -> %s %s : %s" % (time.strftime("%H:%M:%S"), self.path, resp.status, resp.reason, rb[:180].decode(errors="replace")))
+                log(f"[{time.strftime('%H:%M:%S')}] #{rid} << {resp.status} {resp.reason} ({dur:.1f}s, {len(rb)}B): {rb[:200].decode(errors='replace')}")
+            else:
+                log(f"[{time.strftime('%H:%M:%S')}] #{rid} << 200 OK ({dur:.1f}s, {len(rb)}B)")
             self.send_response(resp.status)
             for k, v in resp.getheaders():
                 if k.lower() not in HOP: self.send_header(k, v)
@@ -130,15 +234,15 @@ class Srv(http.server.ThreadingHTTPServer):
 
 if __name__ == "__main__":
     try:
-        if os.path.exists(LOG) and os.path.getsize(LOG) > 500000:
+        if os.path.exists(LOG) and os.path.getsize(LOG) > 5000000:
             open(LOG, "w", encoding="utf-8").close()  # не разрастаться бесконечно
     except Exception: pass
-    log("=== proxy started %s  (->%s://%s:%s)  пишутся только ошибки ===" % (
+    log("=== proxy started %s  (->%s://%s:%s) (detailed logging + SSE tracking) ===" % (
         time.strftime("%Y-%m-%d %H:%M:%S"), "https" if USE_HTTPS else "http", UPSTREAM_HOST, UPSTREAM_PORT))
     try:
         Srv(("127.0.0.1", PORT), H).serve_forever()
     except OSError as e:
-        log("=== proxy НЕ стартовал (порт занят? %s) ===" % e)  # уже запущен другой экземпляр — это норм
+        log("=== proxy НЕ стартовал (порт занят? %s) ===" % e)
 '''
 
 ENSURE_PY = r'''#!/usr/bin/env python3
@@ -174,6 +278,7 @@ set "ANTHROPIC_API_KEY={KEY}"
 REM Модель задаётся через settings.json (+ modelOverrides) — переключается в сессии: /model
 set "ANTHROPIC_SMALL_FAST_MODEL={SMALL}"
 set "CLAUDE_CODE_MAX_CONTEXT_TOKENS={CTX}"
+set "CLAUDE_CODE_ATTRIBUTION_HEADER=0"
 set "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
 set "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1"
 if not "%~1"=="" cd /d "%~1"
@@ -190,6 +295,7 @@ export ANTHROPIC_API_KEY="{KEY}"
 # Модель задаётся через settings.json (+ modelOverrides) — переключается в сессии: /model
 export ANTHROPIC_SMALL_FAST_MODEL="{SMALL}"
 export CLAUDE_CODE_MAX_CONTEXT_TOKENS={CTX}
+export CLAUDE_CODE_ATTRIBUTION_HEADER=0
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1
 TARGET="$1"
