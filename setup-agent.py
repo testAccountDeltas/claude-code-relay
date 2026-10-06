@@ -278,9 +278,9 @@ set "ANTHROPIC_API_KEY={KEY}"
 REM Модель задаётся через settings.json (+ modelOverrides) — переключается в сессии: /model
 set "ANTHROPIC_SMALL_FAST_MODEL={SMALL}"
 set "CLAUDE_CODE_MAX_CONTEXT_TOKENS={CTX}"
+set "CLAUDE_CODE_AUTO_COMPACT_WINDOW={COMPACT}"
 set "CLAUDE_CODE_ATTRIBUTION_HEADER=0"
 set "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
-set "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1"
 if not "%~1"=="" cd /d "%~1"
 claude --dangerously-skip-permissions
 '''
@@ -295,9 +295,9 @@ export ANTHROPIC_API_KEY="{KEY}"
 # Модель задаётся через settings.json (+ modelOverrides) — переключается в сессии: /model
 export ANTHROPIC_SMALL_FAST_MODEL="{SMALL}"
 export CLAUDE_CODE_MAX_CONTEXT_TOKENS={CTX}
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW={COMPACT}
 export CLAUDE_CODE_ATTRIBUTION_HEADER=0
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1
 TARGET="$1"
 [ -n "$TARGET" ] && cd "$TARGET"
 exec claude --dangerously-skip-permissions
@@ -519,15 +519,32 @@ def do_install():
     write(HOME / "config.json", json.dumps(
         {"url": base, "model": model, "proxy_port": PROXY_PORT}, indent=2, ensure_ascii=False))
 
-    ctx = str(windows.get(model) or 200000)   # реальное окно модели из /v1/models
+    raw_ctx = int(windows.get(model) or 200000)
+    # Оставляем запас под системные промпты и инструменты (~50k), чтобы не упираться в жесткий лимит шлюза
+    ctx_val = min(raw_ctx, 1000000) if raw_ctx >= 1000000 else raw_ctx
+    compact_val = int(ctx_val * 0.88)   # авто-компакт срабатывает заранее (на 88% контекста)
+    ctx = str(ctx_val)
+    compact_str = str(compact_val)
     pyexe = sys.executable
     if os.name == "nt":
         launcher = HOME / "launch.cmd"
-        write(launcher, LAUNCH_CMD.replace("{PYTHON}", pyexe).replace("{PORT}", str(PROXY_PORT)).replace("{KEY}", key).replace("{SMALL}", small).replace("{CTX}", ctx))
+        write(launcher, (LAUNCH_CMD
+                         .replace("{PYTHON}", pyexe)
+                         .replace("{PORT}", str(PROXY_PORT))
+                         .replace("{KEY}", key)
+                         .replace("{SMALL}", small)
+                         .replace("{CTX}", ctx)
+                         .replace("{COMPACT}", compact_str)))
         install_menu_windows(launcher)
     else:
         launcher = HOME / "launch.command"
-        write(launcher, LAUNCH_SH.replace("{PYTHON}", pyexe).replace("{PORT}", str(PROXY_PORT)).replace("{KEY}", key).replace("{SMALL}", small).replace("{CTX}", ctx), executable=True)
+        write(launcher, (LAUNCH_SH
+                         .replace("{PYTHON}", pyexe)
+                         .replace("{PORT}", str(PROXY_PORT))
+                         .replace("{KEY}", key)
+                         .replace("{SMALL}", small)
+                         .replace("{CTX}", ctx)
+                         .replace("{COMPACT}", compact_str)), executable=True)
         try: os.chmod(HOME / "config.json", 0o600)
         except Exception: pass
         install_menu_macos()
