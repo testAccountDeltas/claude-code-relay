@@ -33,7 +33,7 @@ PROXY_PY = r'''#!/usr/bin/env python3
 # Фикс-прокси: Claude Code -> сюда -> шлюз. Вырезает system-блок
 # "x-anthropic-billing-header", на котором Gemini-путь шлюза отдаёт 429/503.
 # Стримит SSE, логирует запросы/ответы и отслеживает аномалии (thinking без текста).
-import http.server, http.client, json, time, sys, os
+import http.server, http.client, json, time, sys, os, threading
 
 UPSTREAM_HOST = "__HOST__"
 UPSTREAM_PORT = __PORT_UP__
@@ -135,6 +135,23 @@ def _conn():
     cls = http.client.HTTPSConnection if USE_HTTPS else http.client.HTTPConnection
     return cls(UPSTREAM_HOST, UPSTREAM_PORT, timeout=600)
 
+# Пул keep-alive соединений: переиспользуем открытые TCP+TLS вместо нового на
+# каждый запрос. Обрыв (connect timeout) случается ИМЕННО при установке нового
+# коннекта, когда сервер на миг теряет SYN под нагрузкой CPU; меньше новых
+# коннектов -> меньше шансов словить обрыв. Ретрай ниже страхует остальное.
+_pool = []; _pool_lock = threading.Lock(); _POOL_MAX = 8
+def _acquire():
+    with _pool_lock:
+        if _pool: return _pool.pop(), True
+    return _conn(), False
+def _release(conn, resp, ok):
+    if conn is None: return
+    if ok and resp is not None and not getattr(resp, "will_close", True):
+        with _pool_lock:
+            if len(_pool) < _POOL_MAX: _pool.append(conn); return
+    try: conn.close()
+    except Exception: pass
+
 _req_id = 0
 
 class H(http.server.BaseHTTPRequestHandler):
@@ -152,19 +169,24 @@ class H(http.server.BaseHTTPRequestHandler):
         meta = summarize_req(body) if "/v1/messages" in self.path else f"bytes={n}"
         log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}) {meta}")
 
-        fh = {k: v for k, v in self.headers.items() if k.lower() not in ("host","content-length","accept-encoding")}
+        fh = {k: v for k, v in self.headers.items()
+              if k.lower() not in ("host","content-length","accept-encoding",
+                                    "connection","keep-alive","proxy-connection","te","upgrade")}
         fh["Host"] = UPSTREAM_HOST
         conn = resp = None
-        for attempt in range(1, 4):
+        attempt = 0
+        while True:
+            c, reused = _acquire()
             try:
-                conn = _conn()
-                conn.request(self.command, self.path, body=body, headers=fh)
-                resp = conn.getresponse()
+                c.request(self.command, self.path, body=body, headers=fh)
+                resp = c.getresponse()
             except Exception as e:
+                try: c.close()
+                except Exception: pass
+                if reused: continue  # протухшее keep-alive соединение — молча переоткрываем
+                attempt += 1
                 dur = time.time() - t0
                 log(f"[{time.strftime('%H:%M:%S')}] #{rid} !! conn err after {dur:.1f}s (att {attempt}): {e!r}")
-                try: conn.close()
-                except Exception: pass
                 if attempt < 3:
                     time.sleep(2); continue  # блип связи — повторяем сами, клиент не увидит ошибку
                 try: self.send_error(502, "upstream error")
@@ -173,9 +195,10 @@ class H(http.server.BaseHTTPRequestHandler):
             if resp.status in (429, 503) and attempt < 3:
                 try:
                     rb = resp.read()
-                    log(f"[{time.strftime('%H:%M:%S')}] #{rid} -- attempt {attempt} -> {resp.status} {resp.reason} ({rb[:120].decode(errors='replace')}), retry in 3s")
+                    log(f"[{time.strftime('%H:%M:%S')}] #{rid} -- attempt {attempt+1} -> {resp.status} {resp.reason} ({rb[:120].decode(errors='replace')}), retry in 3s")
                 except Exception: pass
-                conn.close(); time.sleep(3); continue
+                _release(c, resp, ok=True); resp = None; attempt += 1; time.sleep(3); continue
+            conn = c
             break
 
         ctype = resp.getheader("content-type") or ""
@@ -199,8 +222,7 @@ class H(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 stream_err = e
             finally:
-                try: conn.close()
-                except Exception: pass
+                _release(conn, resp, ok=(stream_err is None))  # поток дочитан -> можно переиспользовать
             dur = time.time() - t0
             summary = tracker.summary()
             if stream_err:
@@ -208,8 +230,10 @@ class H(http.server.BaseHTTPRequestHandler):
             else:
                 log(f"[{time.strftime('%H:%M:%S')}] #{rid} << SSE 200 OK ({dur:.1f}s, {total_bytes}B, {chunks} chunks): {summary}")
         else:
+            read_ok = True
             try: rb = resp.read()
             except Exception as e:
+                read_ok = False
                 dur = time.time() - t0
                 log(f"[{time.strftime('%H:%M:%S')}] #{rid} !! read err after {dur:.1f}s: {e!r}"); rb = b""
             dur = time.time() - t0
@@ -223,8 +247,7 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(rb))); self.end_headers()
             try: self.wfile.write(rb)
             except Exception: pass
-            try: conn.close()
-            except Exception: pass
+            _release(conn, resp, ok=read_ok)
     do_POST = _h; do_GET = _h; do_PUT = _h
     def log_message(self, *a): pass
 
