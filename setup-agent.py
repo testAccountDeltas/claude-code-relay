@@ -73,6 +73,20 @@ def _nudge(body):
     except Exception:
         return body
 
+# Fallback-текст, если даже ретраи дали пустой ход (приём auto_heal у agy):
+EMPTY_FALLBACK_TEXT = "(Пустой ответ модели восстановлен прокси — продолжи или повтори запрос.)"
+def _continue(body):
+    """Дописывает user-ход 'Continue.' — подталкивает модель выдать видимый ответ."""
+    try:
+        j = json.loads(body)
+        msgs = j.get("messages")
+        if isinstance(msgs, list):
+            j["messages"] = msgs + [{"role": "user", "content": "Continue."}]
+            return json.dumps(j).encode("utf-8")
+    except Exception:
+        pass
+    return body
+
 def summarize_req(body):
     try:
         j = json.loads(body)
@@ -315,7 +329,7 @@ class H(http.server.BaseHTTPRequestHandler):
                 if st["err"] is None and empty and eretry < EMPTY_RETRY_MAX:
                     eretry += 1
                     log(f"[{time.strftime('%H:%M:%S')}] #{rid} .. EMPTY turn -> splice-retry {eretry}/{EMPTY_RETRY_MAX}")
-                    nb = _nudge(body) if eretry == EMPTY_RETRY_MAX else body
+                    nb = _continue(body if eretry < EMPTY_RETRY_MAX else _nudge(body))
                     cur_conn, cur_resp = _open_upstream(self.command, self.path, nb, fh, rid, t0)
                     if cur_resp is None or "event-stream" not in (cur_resp.getheader("content-type") or ""):
                         if cur_resp is not None: _release(cur_conn, cur_resp, ok=False)
@@ -323,11 +337,20 @@ class H(http.server.BaseHTTPRequestHandler):
                     offset = st["max_index"] + 1; suppress = True; continue
                 final_st = st; break
 
+            injected = False
+            if final_st and final_st["err"] is None and not final_st["saw_text"] and not final_st["saw_tool"]:
+                try:
+                    idx = final_st["max_index"] + 1
+                    _write_frame_obj(self.wfile, {"type":"content_block_start","index":idx,"content_block":{"type":"text","text":""}})
+                    _write_frame_obj(self.wfile, {"type":"content_block_delta","index":idx,"delta":{"type":"text_delta","text":EMPTY_FALLBACK_TEXT}})
+                    _write_frame_obj(self.wfile, {"type":"content_block_stop","index":idx})
+                    injected = True
+                except Exception: pass
             try:
                 for frame in (final_st["held"] if final_st else []): _write_raw(self.wfile, frame)
             except Exception: pass
             dur = time.time() - t0
-            log(f"[{time.strftime('%H:%M:%S')}] #{rid} << SSE done ({dur:.1f}s, empty_retries={eretry}, "
+            log(f"[{time.strftime('%H:%M:%S')}] #{rid} << SSE done ({dur:.1f}s, empty_retries={eretry}, fallback={injected}, "
                 f"text={final_st['saw_text'] if final_st else '?'}, tool={final_st['saw_tool'] if final_st else '?'}, "
                 f"stop={final_st['stop_reason'] if final_st else '?'}"
                 + (f", stream_err={final_st['err']!r}" if final_st and final_st['err'] else "") + ")")
