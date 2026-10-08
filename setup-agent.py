@@ -634,7 +634,10 @@ def do_install():
     # settings.json: слоты пикера -> модели шлюза по именам (переключение /model в сессии)
     settings, (m_high, m_med, m_low, m_extra) = build_settings(model, models)
     write(HOME / "claude-home" / "settings.json", json.dumps(settings, indent=2, ensure_ascii=False))
-    small = m_low
+    # small/fast слот (заголовки/служебные вызовы) — самая дешёвая 'lite'-модель, если есть
+    # (так делает нативный agy: служебное гонит на flash-lite), иначе low-тир.
+    small = next((x for x in ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"] if x in models),
+                 next((x for x in sorted(models) if "lite" in x.lower() and "image" not in x.lower()), m_low))
 
     proxy_src = (PROXY_PY
                  .replace("__HOST__", host)
