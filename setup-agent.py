@@ -153,19 +153,26 @@ def _conn():
 # каждый запрос. Обрыв (connect timeout) случается ИМЕННО при установке нового
 # коннекта, когда сервер на миг теряет SYN под нагрузкой CPU; меньше новых
 # коннектов -> меньше шансов словить обрыв. Ретрай ниже страхует остальное.
-_pool = []; _pool_lock = threading.Lock()
-_POOL_MAX = 0  # keep-alive reuse ОТКЛЮЧЁН: reuse через http.client ловил idle-close
-# от caddy и отдавал обрезанный/чужой ответ (HTTP 200 "not a Message"/оборванный
-# стрим), битые коннекты копились до рестарта. Всегда свежее соединение; connect-блипы ловит ретрай.
+_pool = []; _pool_lock = threading.Lock(); _POOL_MAX = 8
+# НЕ реюзаем соединение, простоявшее дольше этого: http.client не замечает idle-close
+# от caddy -> reuse протухшего отдавал мусор (HTTP 200 "not a Message"/оборванный стрим).
+# Короткий порог ловит выигрыш на tool-loop, но не даёт реюзать залежавшееся; протухшие
+# не копятся (отбрасываются по возрасту при выдаче — то, что раньше лечил рестарт).
+_POOL_IDLE_MAX = 10.0
 def _acquire():
+    now = time.time()
     with _pool_lock:
-        if _pool: return _pool.pop(), True
+        while _pool:
+            conn, ts = _pool.pop()
+            if now - ts <= _POOL_IDLE_MAX: return conn, True
+            try: conn.close()
+            except Exception: pass
     return _conn(), False
 def _release(conn, resp, ok):
     if conn is None: return
     if ok and resp is not None and not getattr(resp, "will_close", True):
         with _pool_lock:
-            if len(_pool) < _POOL_MAX: _pool.append(conn); return
+            if len(_pool) < _POOL_MAX: _pool.append((conn, time.time())); return
     try: conn.close()
     except Exception: pass
 
