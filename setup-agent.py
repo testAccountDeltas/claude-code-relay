@@ -419,10 +419,11 @@ def build_settings(default_model, models):
         env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = extra
         env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] = extra
         env["ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION"] = extra
+    fb = [med] + ([low] if low and low != med else [])   # сперва medium, потом low
     s = {
         "env": env,
-        "model": "sonnet",                 # дефолт -> слот Sonnet (= default model)
-        "fallbackModel": [low],            # запасная, если основная недоступна
+        "model": "sonnet",                 # дефолт -> слот Sonnet (= default model, medium)
+        "fallbackModel": fb,               # при проблемах основной — на medium, затем low
         "skipDangerousModePermissionPrompt": True,
     }
     return s, (high, med, low, extra)
