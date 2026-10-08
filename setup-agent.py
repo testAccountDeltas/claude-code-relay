@@ -42,6 +42,7 @@ PORT          = __PORT__
 LOG           = r"__LOG__"
 MARK          = "x-anthropic-billing-header"
 HOP           = ("transfer-encoding", "connection", "content-length", "content-encoding")
+EMPTY_RETRY_MAX = 2  # сколько раз переиграть пустой ход (thinking-only, без текста/тулов)
 
 def log(s):
     try:
@@ -58,6 +59,19 @@ def scrub(body):
     elif isinstance(sysv, str) and MARK in sysv:
         j["system"] = "\n".join(l for l in sysv.splitlines() if MARK not in l); changed = True
     return (json.dumps(j).encode("utf-8"), True) if changed else (body, False)
+
+_NUDGE = ("IMPORTANT: Produce a visible response now — either a textual answer or a tool "
+          "call. Do NOT end your turn with only internal thinking and no output.")
+def _nudge(body):
+    try:
+        j = json.loads(body)
+        sysv = j.get("system")
+        if isinstance(sysv, list): j["system"] = sysv + [{"type": "text", "text": _NUDGE}]
+        elif isinstance(sysv, str): j["system"] = sysv + "\n\n" + _NUDGE
+        else: j["system"] = _NUDGE
+        return json.dumps(j).encode("utf-8")
+    except Exception:
+        return body
 
 def summarize_req(body):
     try:
@@ -152,6 +166,95 @@ def _release(conn, resp, ok):
     try: conn.close()
     except Exception: pass
 
+# --- SSE-хелперы для recovery пустого хода ---
+def _split_frames(buf):
+    frames = []
+    while "\n\n" in buf:
+        frame, buf = buf.split("\n\n", 1); frames.append(frame)
+    return frames, buf
+def _parse_frame(frame):
+    for line in frame.split("\n"):
+        line = line.strip()
+        if line.startswith("data:"):
+            p = line[5:].strip()
+            if not p or p == "[DONE]": return None, None
+            try: obj = json.loads(p); return obj.get("type"), obj
+            except Exception: return None, None
+    return None, None
+def _write_frame_obj(wfile, obj):
+    wfile.write((f"event: {obj.get('type','')}\ndata: {json.dumps(obj, separators=(',',':'))}\n\n").encode("utf-8")); wfile.flush()
+def _write_raw(wfile, frame):
+    wfile.write((frame + "\n\n").encode("utf-8")); wfile.flush()
+
+def _open_upstream(command, path, body, fh, rid, t0):
+    """Открывает апстрим с ретраями (блип связи + 429/503). (conn, resp) или (None, None)."""
+    attempt = 0
+    while True:
+        c, reused = _acquire()
+        try:
+            c.request(command, path, body=body, headers=fh)
+            resp = c.getresponse()
+        except Exception as e:
+            try: c.close()
+            except Exception: pass
+            if reused: continue
+            attempt += 1
+            dur = time.time() - t0
+            log(f"[{time.strftime('%H:%M:%S')}] #{rid} !! conn err after {dur:.1f}s (att {attempt}): {e!r}")
+            if attempt < 3: time.sleep(2); continue
+            return None, None
+        if resp.status in (429, 503) and attempt < 3:
+            try:
+                rb = resp.read()
+                log(f"[{time.strftime('%H:%M:%S')}] #{rid} -- attempt {attempt+1} -> {resp.status} {resp.reason} ({rb[:120].decode(errors='replace')}), retry in 3s")
+            except Exception: pass
+            _release(c, resp, ok=True); attempt += 1; time.sleep(3); continue
+        return c, resp
+
+def _stream_one(resp, wfile, offset, suppress_start):
+    """Стримит один ответ ЖИВЬЁМ, придерживая терминальные кадры; при offset>0
+    переиндексирует content_block_*; при suppress_start глушит message_start."""
+    st = {"saw_text": False, "saw_tool": False, "saw_thinking": False,
+          "stop_reason": None, "max_index": -1, "held": [], "usage": None, "err": None}
+    buf = ""
+    try:
+        while True:
+            chunk = resp.read(8192)
+            if not chunk: break
+            buf += chunk.decode("utf-8", "replace")
+            frames, buf = _split_frames(buf)
+            for frame in frames:
+                if not frame.strip(): continue
+                typ, obj = _parse_frame(frame)
+                if typ is None: _write_raw(wfile, frame); continue
+                if typ == "message_start":
+                    if not suppress_start: _write_raw(wfile, frame)
+                    continue
+                if typ in ("content_block_start", "content_block_delta", "content_block_stop"):
+                    idx = obj.get("index", 0)
+                    st["max_index"] = max(st["max_index"], idx + offset)
+                    if typ == "content_block_start":
+                        bt = (obj.get("content_block") or {}).get("type")
+                        if bt == "tool_use": st["saw_tool"] = True
+                        elif bt == "thinking": st["saw_thinking"] = True
+                    elif typ == "content_block_delta":
+                        d = obj.get("delta") or {}
+                        if d.get("type") == "text_delta" and (d.get("text") or "").strip(): st["saw_text"] = True
+                        elif d.get("type") == "thinking_delta": st["saw_thinking"] = True
+                    if offset: obj["index"] = idx + offset; _write_frame_obj(wfile, obj)
+                    else: _write_raw(wfile, frame)
+                    continue
+                if typ == "message_delta":
+                    d = obj.get("delta") or {}
+                    if "stop_reason" in d: st["stop_reason"] = d.get("stop_reason")
+                    st["usage"] = obj.get("usage"); st["held"].append(frame); continue
+                if typ == "message_stop":
+                    st["held"].append(frame); continue
+                _write_raw(wfile, frame)
+    except Exception as e:
+        st["err"] = e
+    return st
+
 _req_id = 0
 
 class H(http.server.BaseHTTPRequestHandler):
@@ -173,62 +276,51 @@ class H(http.server.BaseHTTPRequestHandler):
               if k.lower() not in ("host","content-length","accept-encoding",
                                     "connection","keep-alive","proxy-connection","te","upgrade")}
         fh["Host"] = UPSTREAM_HOST
-        conn = resp = None
-        attempt = 0
-        while True:
-            c, reused = _acquire()
-            try:
-                c.request(self.command, self.path, body=body, headers=fh)
-                resp = c.getresponse()
-            except Exception as e:
-                try: c.close()
-                except Exception: pass
-                if reused: continue  # протухшее keep-alive соединение — молча переоткрываем
-                attempt += 1
-                dur = time.time() - t0
-                log(f"[{time.strftime('%H:%M:%S')}] #{rid} !! conn err after {dur:.1f}s (att {attempt}): {e!r}")
-                if attempt < 3:
-                    time.sleep(2); continue  # блип связи — повторяем сами, клиент не увидит ошибку
-                try: self.send_error(502, "upstream error")
-                except Exception: pass
-                return
-            if resp.status in (429, 503) and attempt < 3:
-                try:
-                    rb = resp.read()
-                    log(f"[{time.strftime('%H:%M:%S')}] #{rid} -- attempt {attempt+1} -> {resp.status} {resp.reason} ({rb[:120].decode(errors='replace')}), retry in 3s")
-                except Exception: pass
-                _release(c, resp, ok=True); resp = None; attempt += 1; time.sleep(3); continue
-            conn = c
-            break
+
+        conn, resp = _open_upstream(self.command, self.path, body, fh, rid, t0)
+        if resp is None:
+            try: self.send_error(502, "upstream error")
+            except Exception: pass
+            return
 
         ctype = resp.getheader("content-type") or ""
         if "event-stream" in ctype and resp.status == 200:
-            # ПОТОКОВАЯ передача SSE по мере поступления
+            # ПОТОКОВАЯ передача SSE + recovery пустого хода: стримим содержимое живьём
+            # (thinking виден сразу), но придерживаем терминальные кадры. Если ход вышел
+            # пустым (0 текста, 0 тулов, end_turn) — переоткрываем апстрим и доклеиваем
+            # ответ в тот же поток. Ошибка парсинга/склейки -> отдаём придержанное как есть.
             self.send_response(200)
             for k, v in resp.getheaders():
                 if k.lower() not in HOP: self.send_header(k, v)
             self.send_header("Connection", "close"); self.end_headers()
             self.close_connection = True
-            tracker = SSETracker()
-            total_bytes = chunks = 0
-            stream_err = None
+
+            cur_conn, cur_resp = conn, resp
+            offset, suppress, eretry = 0, False, 0
+            final_st = None
+            while True:
+                st = _stream_one(cur_resp, self.wfile, offset, suppress)
+                _release(cur_conn, cur_resp, ok=(st["err"] is None))
+                empty = (not st["saw_text"] and not st["saw_tool"] and st["stop_reason"] == "end_turn")
+                if st["err"] is None and empty and eretry < EMPTY_RETRY_MAX:
+                    eretry += 1
+                    log(f"[{time.strftime('%H:%M:%S')}] #{rid} .. EMPTY turn -> splice-retry {eretry}/{EMPTY_RETRY_MAX}")
+                    nb = _nudge(body) if eretry == EMPTY_RETRY_MAX else body
+                    cur_conn, cur_resp = _open_upstream(self.command, self.path, nb, fh, rid, t0)
+                    if cur_resp is None or "event-stream" not in (cur_resp.getheader("content-type") or ""):
+                        if cur_resp is not None: _release(cur_conn, cur_resp, ok=False)
+                        final_st = st; break
+                    offset = st["max_index"] + 1; suppress = True; continue
+                final_st = st; break
+
             try:
-                while True:
-                    chunk = resp.read(8192)
-                    if not chunk: break
-                    total_bytes += len(chunk); chunks += 1
-                    tracker.feed(chunk)
-                    self.wfile.write(chunk); self.wfile.flush()
-            except Exception as e:
-                stream_err = e
-            finally:
-                _release(conn, resp, ok=(stream_err is None))  # поток дочитан -> можно переиспользовать
+                for frame in (final_st["held"] if final_st else []): _write_raw(self.wfile, frame)
+            except Exception: pass
             dur = time.time() - t0
-            summary = tracker.summary()
-            if stream_err:
-                log(f"[{time.strftime('%H:%M:%S')}] #{rid} << SSE BROKEN ({dur:.1f}s, {total_bytes}B, {chunks} chunks): err={stream_err!r} | {summary}")
-            else:
-                log(f"[{time.strftime('%H:%M:%S')}] #{rid} << SSE 200 OK ({dur:.1f}s, {total_bytes}B, {chunks} chunks): {summary}")
+            log(f"[{time.strftime('%H:%M:%S')}] #{rid} << SSE done ({dur:.1f}s, empty_retries={eretry}, "
+                f"text={final_st['saw_text'] if final_st else '?'}, tool={final_st['saw_tool'] if final_st else '?'}, "
+                f"stop={final_st['stop_reason'] if final_st else '?'}"
+                + (f", stream_err={final_st['err']!r}" if final_st and final_st['err'] else "") + ")")
         else:
             read_ok = True
             try: rb = resp.read()
