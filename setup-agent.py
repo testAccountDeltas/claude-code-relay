@@ -153,7 +153,10 @@ def _conn():
 # каждый запрос. Обрыв (connect timeout) случается ИМЕННО при установке нового
 # коннекта, когда сервер на миг теряет SYN под нагрузкой CPU; меньше новых
 # коннектов -> меньше шансов словить обрыв. Ретрай ниже страхует остальное.
-_pool = []; _pool_lock = threading.Lock(); _POOL_MAX = 8
+_pool = []; _pool_lock = threading.Lock()
+_POOL_MAX = 0  # keep-alive reuse ОТКЛЮЧЁН: reuse через http.client ловил idle-close
+# от caddy и отдавал обрезанный/чужой ответ (HTTP 200 "not a Message"/оборванный
+# стрим), битые коннекты копились до рестарта. Всегда свежее соединение; connect-блипы ловит ретрай.
 def _acquire():
     with _pool_lock:
         if _pool: return _pool.pop(), True
