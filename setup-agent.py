@@ -163,9 +163,11 @@ class H(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 dur = time.time() - t0
                 log(f"[{time.strftime('%H:%M:%S')}] #{rid} !! conn err after {dur:.1f}s (att {attempt}): {e!r}")
-                try: self.send_error(502, "upstream error")
-                except Exception: pass
                 try: conn.close()
+                except Exception: pass
+                if attempt < 3:
+                    time.sleep(2); continue  # блип связи — повторяем сами, клиент не увидит ошибку
+                try: self.send_error(502, "upstream error")
                 except Exception: pass
                 return
             if resp.status in (429, 503) and attempt < 3:
