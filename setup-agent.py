@@ -406,6 +406,8 @@ REM Модель задаётся через settings.json (+ modelOverrides) �
 set "ANTHROPIC_SMALL_FAST_MODEL={SMALL}"
 set "CLAUDE_CODE_MAX_CONTEXT_TOKENS={CTX}"
 set "CLAUDE_CODE_AUTO_COMPACT_WINDOW={COMPACT}"
+REM потолок вывода как у нативного agy (~65536) — длинные ответы/мышление не режутся
+set "CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000"
 set "CLAUDE_CODE_ATTRIBUTION_HEADER=0"
 set "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
 if not "%~1"=="" cd /d "%~1"
@@ -423,6 +425,8 @@ export ANTHROPIC_API_KEY="{KEY}"
 export ANTHROPIC_SMALL_FAST_MODEL="{SMALL}"
 export CLAUDE_CODE_MAX_CONTEXT_TOKENS={CTX}
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW={COMPACT}
+# потолок вывода как у нативного agy (~65536) — длинные ответы/мышление не режутся
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000
 export CLAUDE_CODE_ATTRIBUTION_HEADER=0
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 TARGET="$1"
