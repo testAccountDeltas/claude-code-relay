@@ -10,6 +10,8 @@ CliRelay Agent — установщик Claude Code в паре с CliRelay (и�
   * создаёт изолированный профиль Claude Code (не трогает твою обычную установку/подписку);
   * добавляет в контекстное меню ПАПКИ пункт «Запустить агента здесь»,
     который запускает `claude --dangerously-skip-permissions` в этой папке через шлюз;
+  * настраивает автозапуск прокси при входе (Windows: ключ Run; macOS: LaunchAgent),
+    чтобы он поднимался сам — в т.ч. для Claude Desktop, у которого нет лаунчера;
   * Windows и macOS.
 
 Запуск:   python setup-agent.py
@@ -640,6 +642,76 @@ def uninstall_menu_macos():
     p = Path.home() / "Library" / "Services" / f"{MENU_LABEL}.workflow"
     if p.exists(): shutil.rmtree(p, ignore_errors=True)
 
+# ───────────────────────── автозапуск прокси при логине ─────────────────────────
+# Нужен, чтобы прокси поднимался сам (особенно для Claude Desktop — у него нет лаунчера,
+# а Claude Code поднимает прокси сам при запуске через меню). Windows: ключ HKCU..\Run
+# (pythonw -> ensure-proxy.py, идемпотентно, без окна). macOS: LaunchAgent (RunAtLoad +
+# KeepAlive — launchd сам стартует при логине и перезапускает, если упал).
+AUTOSTART_NAME = "CliRelayProxy"
+LAUNCH_AGENT_LABEL = "com.clirelay.proxy"
+
+def _pythonw(pyexe: str) -> str:
+    pyw = pyexe.replace("python.exe", "pythonw.exe")
+    return pyw if os.path.exists(pyw) else pyexe
+
+def install_autostart_windows(ensure_py: Path, pyexe: str):
+    import winreg
+    cmd = f'"{_pythonw(pyexe)}" "{ensure_py}"'
+    k = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run")
+    winreg.SetValueEx(k, AUTOSTART_NAME, 0, winreg.REG_SZ, cmd)
+    print("  [+] Автозапуск прокси при входе в Windows добавлен (ключ Run:", AUTOSTART_NAME + ").")
+
+def uninstall_autostart_windows():
+    import winreg
+    try:
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
+        winreg.DeleteValue(k, AUTOSTART_NAME)
+    except (FileNotFoundError, OSError):
+        pass
+
+def install_autostart_macos(proxy_py: Path, pyexe: str):
+    plist_path = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
+    err_log = str(HOME / "launchd.err.log")
+    plist = f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{LAUNCH_AGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{pyexe}</string>
+    <string>{proxy_py}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>{err_log}</string>
+</dict>
+</plist>
+'''
+    write(plist_path, plist)
+    os.system(f'launchctl unload "{plist_path}" 2>/dev/null')
+    os.system(f'launchctl load -w "{plist_path}"')
+    print("  [+] Автозапуск прокси (LaunchAgent) установлен и загружен:", plist_path)
+
+def uninstall_autostart_macos():
+    plist_path = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
+    if plist_path.exists():
+        os.system(f'launchctl unload "{plist_path}" 2>/dev/null')
+        try: plist_path.unlink()
+        except Exception: pass
+
+def start_proxy_now(pyexe: str):
+    """Поднять прокси сразу после установки (чтобы работал без перелогина)."""
+    import subprocess
+    ensure_py = str(HOME / "ensure-proxy.py")
+    try:
+        if os.name == "nt":
+            subprocess.Popen([_pythonw(pyexe), ensure_py], creationflags=0x08000000)  # CREATE_NO_WINDOW
+        else:
+            subprocess.Popen([pyexe, ensure_py], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        pass
+
 # ───────────────────────── основной сценарий ─────────────────────────
 
 def do_install():
@@ -712,6 +784,7 @@ def do_install():
                          .replace("{CTX}", ctx)
                          .replace("{COMPACT}", compact_str)))
         install_menu_windows(launcher)
+        install_autostart_windows(HOME / "ensure-proxy.py", pyexe)
     else:
         launcher = HOME / "launch.command"
         write(launcher, (LAUNCH_SH
@@ -724,6 +797,9 @@ def do_install():
         try: os.chmod(HOME / "config.json", 0o600)
         except Exception: pass
         install_menu_macos()
+        install_autostart_macos(HOME / "relay-proxy.py", pyexe)
+
+    start_proxy_now(pyexe)   # поднять прокси сразу (на macOS уже поднял launchd)
 
     print("\n=== Готово ===")
     print(f"  Профиль/файлы: {HOME}")
@@ -731,6 +807,8 @@ def do_install():
     print(f"  Лог ошибок шлюза (тихий прокси пишет сюда): {HOME / 'relay-proxy.log'}")
     print("  Правый клик по папке ->", MENU_LABEL, "-> Claude Code стартует в ней с --dangerously-skip-permissions.")
     print("  Прокси работает ТИХО, без окна, один на все сессии (сколько бы папок ни открыл).")
+    print("  Автозапуск прокси при входе настроен (Windows: ключ Run; macOS: LaunchAgent) —")
+    print("    он поднимается сам, в т.ч. для Claude Desktop (у него нет лаунчера). Запущен уже сейчас.")
     print("\n  Модели в пикере /model (по именам, переключение прямо в сессии):")
     print(f"      Opus   -> {m_high}")
     print(f"      Sonnet -> {m_med}   (дефолт)")
@@ -743,10 +821,12 @@ def do_install():
 
 def do_uninstall():
     import shutil
-    if os.name == "nt": uninstall_menu_windows()
-    else: uninstall_menu_macos()
+    if os.name == "nt":
+        uninstall_menu_windows(); uninstall_autostart_windows()
+    else:
+        uninstall_menu_macos(); uninstall_autostart_macos()
     if HOME.exists(): shutil.rmtree(HOME, ignore_errors=True)
-    print("CliRelay Agent удалён (меню + файлы). Профиль Claude Code тоже удалён.")
+    print("CliRelay Agent удалён (меню + автозапуск + файлы). Профиль Claude Code тоже удалён.")
     return 0
 
 if __name__ == "__main__":
