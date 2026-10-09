@@ -76,6 +76,25 @@ def remap_model(body):
     except Exception: pass
     return body, None
 
+# «Уровень мышления». Claude Code шлёт thinking:{type:"adaptive"}, шлюз жёстко маппит
+# adaptive -> thinkingLevel="high" (=по сути безлимит). Значения сняты с НАТИВНОГО agy
+# (--effort -> thinkingBudget): low=1000, medium=4000, high=-1(динамика). Навешиваем
+# суффикс имени модели -> шлюз берёт его в приоритете над adaptive. "" = не менять.
+THINK_SUFFIX = "(4000)"  # agy medium; low="(1000)", high="(-1)"
+def set_thinking(body):
+    if not THINK_SUFFIX:
+        return body, None
+    try:
+        j = json.loads(body)
+        m = j.get("model"); th = j.get("thinking")
+        if (isinstance(m, str) and m and not m.endswith(")")
+                and isinstance(th, dict) and th.get("type") in ("adaptive", "enabled")):
+            j["model"] = m + THINK_SUFFIX
+            return json.dumps(j).encode("utf-8"), (m, j["model"])
+    except Exception:
+        pass
+    return body, None
+
 _NUDGE = ("IMPORTANT: Produce a visible response now — either a textual answer or a tool "
           "call. Do NOT end your turn with only internal thinking and no output.")
 def _nudge(body):
@@ -312,9 +331,11 @@ class H(http.server.BaseHTTPRequestHandler):
         raw_body = self.rfile.read(n) if n else b""
         body, scrubbed = scrub(raw_body)
         body, remapped = remap_model(body)
+        body, think = set_thinking(body)
         meta = summarize_req(body) if "/v1/messages" in self.path else f"bytes={n}"
         rm = f" remap={remapped[0]}->{remapped[1]}" if remapped else ""
-        log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}){rm} {meta}")
+        tc = f" think={think[0]}->{think[1]}" if think else ""
+        log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}){rm}{tc} {meta}")
 
         fh = {k: v for k, v in self.headers.items()
               if k.lower() not in ("host","content-length","accept-encoding",
