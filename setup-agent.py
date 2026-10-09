@@ -76,24 +76,33 @@ def remap_model(body):
     except Exception: pass
     return body, None
 
-# «Уровень мышления». Claude Code шлёт thinking:{type:"adaptive"}, шлюз жёстко маппит
-# adaptive -> thinkingLevel="high" (=по сути безлимит). Значения сняты с НАТИВНОГО agy
-# (--effort -> thinkingBudget): low=1000, medium=4000, high=-1(динамика). Навешиваем
-# суффикс имени модели -> шлюз берёт его в приоритете над adaptive. "" = не менять.
-THINK_SUFFIX = "(4000)"  # agy medium; low="(1000)", high="(-1)"
+# «Уровень мышления» как в НАТИВНОМ agy. Claude Code шлёт thinking:{type:"adaptive"}, шлюз
+# жёстко маппит adaptive -> thinkingLevel="high" (=безлимит), т.е. UI-«medium» = agy-HIGH.
+# Пиним бюджет суффиксом имени модели (в шлюзе приоритетнее adaptive). Уровень — ПО ТИРУ
+# имени (-low/-medium/-high), снято с agy: low=1000, medium=4000, high=-1(динамика).
+# Переключается сменой модели (/model opus|sonnet|haiku -> high|medium|low).
+# THINK_FORCE непусто -> форсит один бюджет для всех.
+THINK_BY_TIER = [("-high", "(-1)"), ("-medium", "(4000)"), ("-low", "(1000)")]
+THINK_FORCE   = ""        # "" = по тиру модели; иначе форс всем, напр. "(4000)"
+THINK_DEFAULT = "(4000)"  # тир не распознан; "" = такие модели не трогать
 def set_thinking(body):
-    if not THINK_SUFFIX:
-        return body, None
     try:
         j = json.loads(body)
         m = j.get("model"); th = j.get("thinking")
-        if (isinstance(m, str) and m and not m.endswith(")")
+        if not (isinstance(m, str) and m and not m.endswith(")")
                 and isinstance(th, dict) and th.get("type") in ("adaptive", "enabled")):
-            j["model"] = m + THINK_SUFFIX
-            return json.dumps(j).encode("utf-8"), (m, j["model"])
+            return body, None
+        sfx = THINK_FORCE
+        if not sfx:
+            sfx = THINK_DEFAULT
+            for tier, s in THINK_BY_TIER:
+                if m.endswith(tier): sfx = s; break
+        if not sfx:
+            return body, None
+        j["model"] = m + sfx
+        return json.dumps(j).encode("utf-8"), (m, j["model"])
     except Exception:
-        pass
-    return body, None
+        return body, None
 
 _NUDGE = ("IMPORTANT: Produce a visible response now — either a textual answer or a tool "
           "call. Do NOT end your turn with only internal thinking and no output.")
