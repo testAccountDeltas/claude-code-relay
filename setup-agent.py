@@ -643,6 +643,28 @@ def build_settings(default_model, models):
     }
     return s, (high, med, low, extra)
 
+def build_desktop_import(key, port):
+    """Конфиг для импорта в Claude Desktop (у него нет лаунчера/выбора моделей — он
+    принимает такой gateway-JSON). Имена ДОЛЖНЫ выглядеть «по-Anthropic» (claude-*),
+    поэтому берём claude-* — наш прокси ремапит их в gemini (MODEL_MAP). Уровень
+    мышления в Desktop задаётся его собственным /effort (output_config.effort) — прокси
+    уважает его так же, как в Claude Code. Ключ/порт подставляются из install-time."""
+    return {
+        "inferenceProvider": "gateway",
+        "inferenceGatewayBaseUrl": f"http://127.0.0.1:{port}/v1",
+        "inferenceCredentialKind": "static",
+        "inferenceGatewayApiKey": key,
+        "inferenceGatewayAuthScheme": "bearer",
+        "inferenceModels": [
+            {"name": "claude-opus-4-8",   "anthropicFamilyTier": "opus",   "supports1m": True, "isFamilyDefault": True},
+            {"name": "claude-sonnet-4-5", "anthropicFamilyTier": "sonnet", "supports1m": True, "isFamilyDefault": True},
+            {"name": "claude-haiku-4-5",  "anthropicFamilyTier": "haiku",  "supports1m": True, "isFamilyDefault": True},
+        ],
+        "modelDiscoveryEnabled": False,
+        "modelPrefer1mContext": True,
+        "defaultModelEffort": "high",
+    }
+
 def write(path: Path, text: str, executable=False):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -807,6 +829,9 @@ def do_install():
     write(HOME / "ensure-proxy.py", ENSURE_PY.replace("__PORT__", str(PROXY_PORT)))
     write(HOME / "config.json", json.dumps(
         {"url": base, "model": model, "proxy_port": PROXY_PORT}, indent=2, ensure_ascii=False))
+    # конфиг для импорта в Claude Desktop (claude-* имена -> ремап в gemini нашим прокси)
+    desktop_import = HOME / "claude-desktop-import.json"
+    write(desktop_import, json.dumps(build_desktop_import(key, PROXY_PORT), indent=2, ensure_ascii=False))
 
     raw_ctx = int(windows.get(model) or 200000)
     # Оставляем запас под системные промпты и инструменты (~50k), чтобы не упираться в жесткий лимит шлюза
@@ -850,6 +875,8 @@ def do_install():
     print("  Прокси работает ТИХО, без окна, один на все сессии (сколько бы папок ни открыл).")
     print("  Автозапуск прокси при входе настроен (Windows: ключ Run; macOS: LaunchAgent) —")
     print("    он поднимается сам, в т.ч. для Claude Desktop (у него нет лаунчера). Запущен уже сейчас.")
+    print(f"  Claude Desktop: импортируй {desktop_import}")
+    print("    (Desktop -> настройки стороннего gateway -> вставить этот JSON; уровень мышления — его /effort).")
     print("\n  Модели в пикере /model (по именам, переключение прямо в сессии):")
     print(f"      Opus   -> {m_high}")
     print(f"      Sonnet -> {m_med}   (дефолт)")
