@@ -60,6 +60,20 @@ def scrub(body):
         j["system"] = "\n".join(l for l in sysv.splitlines() if MARK not in l); changed = True
     return (json.dumps(j).encode("utf-8"), True) if changed else (body, False)
 
+# Ремап claude-имён -> модели шлюза (для Claude Desktop: он требует Anthropic-вид имени,
+# поэтому в inferenceModels задаём claude-* + supports1m, а gemini подставляем здесь).
+# Claude Code не затрагивается — он шлёт gemini-* (префикс не 'claude-').
+MODEL_MAP = [("claude-opus","gemini-3.8-flash-high"),("claude-fable","gemini-3.8-flash-high"),("claude-mythos","gemini-3.8-flash-high"),("claude-sonnet","gemini-3.8-flash-medium"),("claude-haiku","gemini-3.8-flash-low")]
+def remap_model(body):
+    try:
+        j = json.loads(body); m = j.get("model","")
+        for pref, tgt in MODEL_MAP:
+            if isinstance(m,str) and m.startswith(pref):
+                j["model"] = tgt
+                return json.dumps(j).encode("utf-8"), (m, tgt)
+    except Exception: pass
+    return body, None
+
 _NUDGE = ("IMPORTANT: Produce a visible response now — either a textual answer or a tool "
           "call. Do NOT end your turn with only internal thinking and no output.")
 def _nudge(body):
@@ -290,11 +304,15 @@ class H(http.server.BaseHTTPRequestHandler):
         t0 = time.time()
         ts = time.strftime("%H:%M:%S")
 
+        if "/v1/v1/" in self.path:
+            self.path = self.path.replace("/v1/v1/", "/v1/", 1)  # base_url задан с лишним /v1
         n = int(self.headers.get("Content-Length") or 0)
         raw_body = self.rfile.read(n) if n else b""
         body, scrubbed = scrub(raw_body)
+        body, remapped = remap_model(body)
         meta = summarize_req(body) if "/v1/messages" in self.path else f"bytes={n}"
-        log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}) {meta}")
+        rm = f" remap={remapped[0]}->{remapped[1]}" if remapped else ""
+        log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}){rm} {meta}")
 
         fh = {k: v for k, v in self.headers.items()
               if k.lower() not in ("host","content-length","accept-encoding",
