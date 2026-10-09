@@ -79,10 +79,11 @@ def remap_model(body):
 # «Уровень мышления» как в НАТИВНОМ agy. Claude Code шлёт thinking:{type:"adaptive"}, шлюз
 # жёстко маппит adaptive -> thinkingLevel="high" (=безлимит), т.е. UI-«medium» = agy-HIGH.
 # Пиним бюджет суффиксом имени модели (в шлюзе приоритетнее adaptive). Уровень — ПО ТИРУ
-# имени (-low/-medium/-high), снято с agy: low=1000, medium=4000, high=-1(динамика).
+# имени (-low/-medium/-high), снято с agy: low=1000, medium=4000. high: agy шлёт -1(безлимит),
+# но мы держим high ОГРАНИЧЕННЫМ (24576 = потолок high-полосы) против runaway/«зависаний».
 # Переключается сменой модели (/model opus|sonnet|haiku -> high|medium|low).
 # THINK_FORCE непусто -> форсит один бюджет для всех.
-THINK_BY_TIER = [("-high", "(-1)"), ("-medium", "(4000)"), ("-low", "(1000)")]
+THINK_BY_TIER = [("-high", "(24576)"), ("-medium", "(4000)"), ("-low", "(1000)")]
 THINK_FORCE   = ""        # "" = по тиру модели; иначе форс всем, напр. "(4000)"
 THINK_DEFAULT = "(4000)"  # тир не распознан; "" = такие модели не трогать
 def set_thinking(body):
