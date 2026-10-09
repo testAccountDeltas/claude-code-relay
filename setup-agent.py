@@ -76,16 +76,16 @@ def remap_model(body):
     except Exception: pass
     return body, None
 
-# «Уровень мышления» как в НАТИВНОМ agy. Claude Code шлёт thinking:{type:"adaptive"}, шлюз
-# жёстко маппит adaptive -> thinkingLevel="high" (=безлимит), т.е. UI-«medium» = agy-HIGH.
-# Пиним бюджет суффиксом имени модели (в шлюзе приоритетнее adaptive). Уровень — ПО ТИРУ
-# имени (-low/-medium/-high), снято с agy: low=1000, medium=4000. high: agy шлёт -1(безлимит),
-# но мы держим high ОГРАНИЧЕННЫМ (24576 = потолок high-полосы) против runaway/«зависаний».
-# Переключается сменой модели (/model opus|sonnet|haiku -> high|medium|low).
-# THINK_FORCE непусто -> форсит один бюджет для всех.
+# «Уровень мышления». Claude Code шлёт thinking:{type:"adaptive"}, а уровень усилия — в
+# ОТДЕЛЬНОМ поле output_config.effort (это /effort в CLI: low/medium/high/xhigh/max). Оно
+# приходит В КАЖДОМ запросе и это ЯВНЫЙ выбор пользователя -> ПРИОРИТЕТ. Gemini-путь шлюза
+# output_config НЕ читает, поэтому /effort был мёртв — переводим его сами в бюджет-суффикс
+# (в шлюзе суффикс приоритетнее adaptive). EFFORT_MAP: /effort->бюджет; THINK_BY_TIER — запас,
+# если effort нет. agy: low=1000/medium=4000; high ограничили до 24576 (agy -1=безлимит).
+EFFORT_MAP    = {"low": "(1000)", "medium": "(4000)", "high": "(24576)", "xhigh": "(24576)", "max": "(24576)"}
 THINK_BY_TIER = [("-high", "(24576)"), ("-medium", "(4000)"), ("-low", "(1000)")]
-THINK_FORCE   = ""        # "" = по тиру модели; иначе форс всем, напр. "(4000)"
-THINK_DEFAULT = "(4000)"  # тир не распознан; "" = такие модели не трогать
+THINK_FORCE   = ""        # "" = по effort/тиру; иначе форс всем, напр. "(4000)"
+THINK_DEFAULT = "(4000)"  # ни effort, ни тир не распознаны
 def set_thinking(body):
     try:
         j = json.loads(body)
@@ -93,15 +93,20 @@ def set_thinking(body):
         if not (isinstance(m, str) and m and not m.endswith(")")
                 and isinstance(th, dict) and th.get("type") in ("adaptive", "enabled")):
             return body, None
-        sfx = THINK_FORCE
-        if not sfx:
-            sfx = THINK_DEFAULT
-            for tier, s in THINK_BY_TIER:
-                if m.endswith(tier): sfx = s; break
+        if THINK_FORCE:
+            sfx, src = THINK_FORCE, "force"
+        else:
+            eff = (j.get("output_config") or {}).get("effort")
+            if isinstance(eff, str) and eff.lower() in EFFORT_MAP:
+                sfx, src = EFFORT_MAP[eff.lower()], "effort:" + eff.lower()
+            else:
+                sfx, src = THINK_DEFAULT, "default"
+                for tier, s in THINK_BY_TIER:
+                    if m.endswith(tier): sfx, src = s, "tier" + tier; break
         if not sfx:
             return body, None
         j["model"] = m + sfx
-        return json.dumps(j).encode("utf-8"), (m, j["model"])
+        return json.dumps(j).encode("utf-8"), (m, j["model"], src)
     except Exception:
         return body, None
 
@@ -344,7 +349,7 @@ class H(http.server.BaseHTTPRequestHandler):
         body, think = set_thinking(body)
         meta = summarize_req(body) if "/v1/messages" in self.path else f"bytes={n}"
         rm = f" remap={remapped[0]}->{remapped[1]}" if remapped else ""
-        tc = f" think={think[0]}->{think[1]}" if think else ""
+        tc = f" think={think[1]}[{think[2]}]" if think else ""
         log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}){rm}{tc} {meta}")
 
         fh = {k: v for k, v in self.headers.items()
