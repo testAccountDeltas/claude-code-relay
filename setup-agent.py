@@ -209,9 +209,11 @@ class SSETracker:
             res += " [!!! EMPTY_VISIBLE_OUTPUT: thinking-only, 0 text, end_turn !!!]"
         return res
 
+_CONNECT_TIMEOUT = 4    # короткий таймаут на connect+TLS: мёртвый SYN (10060) отваливается за ~4с, не за 21с
+_READ_TIMEOUT    = 600  # после установки соединения — длинный таймаут на чтение SSE-стрима
 def _conn():
     cls = http.client.HTTPSConnection if USE_HTTPS else http.client.HTTPConnection
-    return cls(UPSTREAM_HOST, UPSTREAM_PORT, timeout=600)
+    return cls(UPSTREAM_HOST, UPSTREAM_PORT, timeout=_CONNECT_TIMEOUT)
 
 # Пул keep-alive соединений: переиспользуем открытые TCP+TLS вместо нового на
 # каждый запрос. Обрыв (connect timeout) случается ИМЕННО при установке нового
@@ -266,6 +268,9 @@ def _open_upstream(command, path, body, fh, rid, t0):
     while True:
         c, reused = _acquire()
         try:
+            if not reused:
+                c.connect()                       # форсим connect с коротким таймаутом (_CONNECT_TIMEOUT)
+                c.sock.settimeout(_READ_TIMEOUT)  # после установки — длинный таймаут на чтение стрима
             c.request(command, path, body=body, headers=fh)
             resp = c.getresponse()
         except Exception as e:
@@ -275,7 +280,7 @@ def _open_upstream(command, path, body, fh, rid, t0):
             attempt += 1
             dur = time.time() - t0
             log(f"[{time.strftime('%H:%M:%S')}] #{rid} !! conn err after {dur:.1f}s (att {attempt}): {e!r}")
-            if attempt < 3: time.sleep(2); continue
+            if attempt < 5: time.sleep(0.5); continue
             return None, None
         if resp.status in (429, 503) and attempt < 3:
             try:
