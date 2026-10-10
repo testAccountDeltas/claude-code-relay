@@ -46,9 +46,27 @@ MARK          = "x-anthropic-billing-header"
 HOP           = ("transfer-encoding", "connection", "content-length", "content-encoding")
 EMPTY_RETRY_MAX = 2  # сколько раз переиграть пустой ход (thinking-only, без текста/тулов)
 
+# Ротация лога: как только файл перевалил за LOG_MAX_BYTES, его сдвигают в .1 (старый .1 -> .2,
+# .2 -> .3, .3 удаляется) и пишут в свежий LOG. Не больше LOG_BACKUPS бэкапов — старые утилизируются.
+LOG_MAX_BYTES = 512 * 1024
+LOG_BACKUPS = 3
+_log_lock = threading.Lock()
+def _rotate_log():
+    try:
+        if not os.path.exists(LOG) or os.path.getsize(LOG) < LOG_MAX_BYTES: return
+        oldest = f"{LOG}.{LOG_BACKUPS}"
+        if os.path.exists(oldest): os.remove(oldest)
+        for i in range(LOG_BACKUPS - 1, 0, -1):
+            src = f"{LOG}.{i}"
+            if os.path.exists(src): os.replace(src, f"{LOG}.{i + 1}")
+        os.replace(LOG, f"{LOG}.1")
+    except Exception: pass
+
 def log(s):
     try:
-        with open(LOG, "a", encoding="utf-8") as f: f.write(s + "\n")
+        with _log_lock:
+            _rotate_log()
+            with open(LOG, "a", encoding="utf-8") as f: f.write(s + "\n")
     except Exception: pass
 
 def scrub(body):
@@ -444,10 +462,6 @@ class Srv(http.server.ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 if __name__ == "__main__":
-    try:
-        if os.path.exists(LOG) and os.path.getsize(LOG) > 5000000:
-            open(LOG, "w", encoding="utf-8").close()  # не разрастаться бесконечно
-    except Exception: pass
     log("=== proxy started %s  (->%s://%s:%s) (detailed logging + SSE tracking) ===" % (
         time.strftime("%Y-%m-%d %H:%M:%S"), "https" if USE_HTTPS else "http", UPSTREAM_HOST, UPSTREAM_PORT))
     try:
