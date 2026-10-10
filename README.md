@@ -9,7 +9,41 @@ talking to your gateway. Windows & macOS.
 > правый клик по папке → **«Запустить агента здесь»** → Claude Code открывается в этой
 > папке с `--dangerously-skip-permissions`, работая через шлюз на твоей подписке.
 
-## The `x-anthropic-billing-header` fix (why this exists)
+## Why this exists
+
+A CLIProxyAPI/CliRelay gateway lets you talk to other models (Gemini, GPT, …) through an
+Anthropic-compatible API, using your own subscription instead of per-token Anthropic billing.
+Point Claude Code at one with `ANTHROPIC_BASE_URL` and in principle it should just work — in
+practice it breaks in three separate, invisible-from-the-outside ways:
+
+- **It fails outright.** The very first request 503s — looks like a quota problem, isn't (see
+  below).
+- **`/effort` silently does nothing.** The thinking-depth control in Claude Code/Desktop
+  looks like it works, but the gateway ignores it, so every turn thinks at an unbounded,
+  unpredictable depth — including on trivial questions.
+- **It stalls.** A dropped connection costs Claude Code's full default timeout before it
+  retries, which just reads as the agent "doing nothing" for tens of seconds.
+
+This repo is one proxy + installer that fixes all three transparently. You keep using Claude
+Code exactly as normal — same `/model`, same `/effort`, same workflow — it just works.
+
+> ### Зачем это нужно (RU)
+> Шлюз CLIProxyAPI/CliRelay даёт доступ к другим моделям (Gemini, GPT, …) через
+> Anthropic-совместимый API, по твоей подписке, а не по токенам Anthropic. В теории
+> достаточно указать Claude Code на него через `ANTHROPIC_BASE_URL` — на деле он ломается
+> тремя разными, незаметными снаружи способами:
+> - **падает сразу** — первый же запрос 503, выглядит как проблема с квотой, но это не она;
+> - **`/effort` молча ничего не делает** — регулятор глубины мышления в Claude Code/Desktop
+>   выглядит рабочим, но шлюз его игнорирует, и каждый ход думает на неограниченную,
+>   непредсказуемую глубину — даже на тривиальных вопросах;
+> - **зависает** — оборванное соединение стоит Claude Code полного дефолтного таймаута
+>   перед повтором, со стороны это выглядит как «агент ничего не делает» десятки секунд.
+>
+> Этот репозиторий — один прокси + установщик, который чинит все три проблемы прозрачно.
+> Работаешь в Claude Code как обычно — те же `/model`, `/effort`, тот же воркфлоу — просто
+> теперь оно работает.
+
+## The `x-anthropic-billing-header` fix
 
 Point Claude Code at a CLIProxyAPI/Antigravity gateway via `ANTHROPIC_BASE_URL` and the very
 first request fails with:
@@ -42,6 +76,11 @@ python setup-agent.py
 - Ставит **тихий фикс-прокси** (`~/.clirelay-agent/relay-proxy.py`): вырезает служебный
   system-блок `x-anthropic-billing-header`, из-за которого шлюз иначе отдаёт 429/503.
   Работает **без окна**, один на все сессии (проверяет порт, не плодит процессы).
+- Переводит `/effort` (low/medium/high) в реальный бюджет мышления для шлюза — он
+  это поле иначе игнорирует. Без ограничения в safety-режиме «high» не уходит в
+  бесконечное раздумье — верхняя граница 24576 токенов.
+- Короткий таймаут на обрыв соединения (4с вместо дефолтных ~20с) + больше попыток —
+  обрыв не превращается в «агент завис на минуту».
 - Создаёт **изолированный профиль** Claude Code (`~/.clirelay-agent/claude-home`) с
   авторизацией строго по API-ключу (`CLAUDE_CODE_SIMPLE=1`) — твою обычную установку
   и OAuth-подписку Anthropic не трогает.
