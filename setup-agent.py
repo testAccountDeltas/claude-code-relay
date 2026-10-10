@@ -167,6 +167,8 @@ def summarize_req(body):
         th_s = ""
         if isinstance(thinking, dict):
             th_s = f" th={thinking.get('type')}:{thinking.get('budget_tokens')}"
+        eff = (j.get("output_config") or {}).get("effort")
+        if eff: th_s += f" effort={eff}"
         return f"model={model} msgs={m_cnt} stream={stream} max_tok={max_tok}{th_s}"
     except Exception:
         return f"raw_len={len(body)}"
@@ -312,7 +314,8 @@ def _stream_one(resp, wfile, offset, suppress_start):
     """Стримит один ответ ЖИВЬЁМ, придерживая терминальные кадры; при offset>0
     переиндексирует content_block_*; при suppress_start глушит message_start."""
     st = {"saw_text": False, "saw_tool": False, "saw_thinking": False,
-          "stop_reason": None, "max_index": -1, "held": [], "usage": None, "err": None}
+          "stop_reason": None, "max_index": -1, "held": [], "usage": None, "err": None,
+          "tool_names": []}
     buf = ""
     try:
         while True:
@@ -331,8 +334,11 @@ def _stream_one(resp, wfile, offset, suppress_start):
                     idx = obj.get("index", 0)
                     st["max_index"] = max(st["max_index"], idx + offset)
                     if typ == "content_block_start":
-                        bt = (obj.get("content_block") or {}).get("type")
-                        if bt == "tool_use": st["saw_tool"] = True
+                        cb = obj.get("content_block") or {}
+                        bt = cb.get("type")
+                        if bt == "tool_use":
+                            st["saw_tool"] = True
+                            st["tool_names"].append(cb.get("name"))
                         elif bt == "thinking": st["saw_thinking"] = True
                     elif typ == "content_block_delta":
                         d = obj.get("delta") or {}
@@ -432,6 +438,7 @@ class H(http.server.BaseHTTPRequestHandler):
             log(f"[{time.strftime('%H:%M:%S')}] #{rid} << SSE done ({dur:.1f}s, empty_retries={eretry}, fallback={injected}, "
                 f"text={final_st['saw_text'] if final_st else '?'}, tool={final_st['saw_tool'] if final_st else '?'}, "
                 f"stop={final_st['stop_reason'] if final_st else '?'}"
+                + (f", tool_names={final_st['tool_names']}" if final_st and final_st.get('tool_names') else "")
                 + (f", stream_err={final_st['err']!r}" if final_st and final_st['err'] else "") + ")")
         else:
             read_ok = True
@@ -496,10 +503,12 @@ LAUNCH_CMD = r'''@echo off
 chcp 65001 >nul
 set "AGENT_HOME=%USERPROFILE%\.clirelay-agent"
 "{PYTHON}" "%AGENT_HOME%\ensure-proxy.py"
-set "CLAUDE_CODE_SIMPLE=1"
+REM CLAUDE_CODE_SIMPLE отключён: он режет инструмент Agent (суб-агенты) и ещё ~10 других
 set "CLAUDE_CONFIG_DIR=%AGENT_HOME%\claude-home"
 set "ANTHROPIC_BASE_URL=http://127.0.0.1:{PORT}"
-set "ANTHROPIC_API_KEY={KEY}"
+REM ANTHROPIC_AUTH_TOKEN, не API_KEY: последний требует интерактивного подтверждения
+REM ("Do you want to use this API key? No (recommended)"), в headless-режиме отвечать некому -> "Not logged in".
+set "ANTHROPIC_AUTH_TOKEN={KEY}"
 REM Модель задаётся через settings.json (+ modelOverrides) — переключается в сессии: /model
 set "ANTHROPIC_SMALL_FAST_MODEL={SMALL}"
 set "CLAUDE_CODE_MAX_CONTEXT_TOKENS={CTX}"
@@ -515,10 +524,12 @@ claude --dangerously-skip-permissions
 LAUNCH_SH = r'''#!/bin/bash
 AGENT_HOME="$HOME/.clirelay-agent"
 "{PYTHON}" "$AGENT_HOME/ensure-proxy.py"
-export CLAUDE_CODE_SIMPLE=1
+# CLAUDE_CODE_SIMPLE отключён: он режет инструмент Agent (суб-агенты) и ещё ~10 других
 export CLAUDE_CONFIG_DIR="$AGENT_HOME/claude-home"
 export ANTHROPIC_BASE_URL="http://127.0.0.1:{PORT}"
-export ANTHROPIC_API_KEY="{KEY}"
+# ANTHROPIC_AUTH_TOKEN, не API_KEY: последний требует интерактивного подтверждения
+# ("Do you want to use this API key? No (recommended)"), в headless-режиме отвечать некому -> "Not logged in".
+export ANTHROPIC_AUTH_TOKEN="{KEY}"
 # Модель задаётся через settings.json (+ modelOverrides) — переключается в сессии: /model
 export ANTHROPIC_SMALL_FAST_MODEL="{SMALL}"
 export CLAUDE_CODE_MAX_CONTEXT_TOKENS={CTX}
