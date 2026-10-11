@@ -303,11 +303,13 @@ def _open_upstream(command, path, body, fh, rid, t0):
             if attempt < 5: time.sleep(0.5); continue
             return None, None
         if resp.status in (429, 503) and attempt < 3:
+            ok_read = True
             try:
                 rb = resp.read()
                 log(f"[{time.strftime('%H:%M:%S')}] #{rid} -- attempt {attempt+1} -> {resp.status} {resp.reason} ({rb[:120].decode(errors='replace')}), retry in 3s")
-            except Exception: pass
-            _release(c, resp, ok=True); attempt += 1; time.sleep(3); continue
+            except Exception:
+                ok_read = False  # тело не дочитано -> нельзя реюзать соединение как чистое
+            _release(c, resp, ok=ok_read); attempt += 1; time.sleep(3); continue
         return c, resp
 
 def _stream_one(resp, wfile, offset, suppress_start):
@@ -364,14 +366,16 @@ def _stream_one(resp, wfile, offset, suppress_start):
         st["err"] = e
     return st
 
+_req_id_lock = threading.Lock()
 _req_id = 0
 
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def _h(self):
         global _req_id
-        _req_id += 1
-        rid = _req_id
+        with _req_id_lock:
+            _req_id += 1
+            rid = _req_id
         t0 = time.time()
         ts = time.strftime("%H:%M:%S")
 
@@ -416,10 +420,11 @@ class H(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
 
             cur_conn, cur_resp = conn, resp
-            offset, suppress, eretry = 0, False, 0
+            offset, suppress, eretry, next_idx = 0, False, 0, 0
             final_st = None
             while True:
                 st = _stream_one(cur_resp, self.wfile, offset, suppress)
+                next_idx = max(next_idx, st["max_index"] + 1)  # сквозной счётчик индексов блоков через все сплайсы
                 _release(cur_conn, cur_resp, ok=(st["err"] is None))
                 empty = (not st["saw_text"] and not st["saw_tool"] and st["stop_reason"] == "end_turn")
                 if st["err"] is None and empty and eretry < EMPTY_RETRY_MAX:
@@ -430,13 +435,17 @@ class H(http.server.BaseHTTPRequestHandler):
                     if cur_resp is None or "event-stream" not in (cur_resp.getheader("content-type") or ""):
                         if cur_resp is not None: _release(cur_conn, cur_resp, ok=False)
                         final_st = st; break
-                    offset = st["max_index"] + 1; suppress = True; continue
+                    offset = next_idx; suppress = True; continue
                 final_st = st; break
 
             injected = False
-            if final_st and final_st["err"] is None and not final_st["saw_text"] and not final_st["saw_tool"]:
+            # Если стрим оборвался без ошибки, но и без message_stop (final_st["held"] пуст),
+            # ход не завершён формально -> не выдаём fallback-текст как замену ответу, честно
+            # отдаём что есть (клиент увидит оборванное сообщение, но не ложный "ответ").
+            if (final_st and final_st["err"] is None and final_st["held"]
+                    and not final_st["saw_text"] and not final_st["saw_tool"]):
                 try:
-                    idx = final_st["max_index"] + 1
+                    idx = next_idx
                     _write_frame_obj(self.wfile, {"type":"content_block_start","index":idx,"content_block":{"type":"text","text":""}})
                     _write_frame_obj(self.wfile, {"type":"content_block_delta","index":idx,"delta":{"type":"text_delta","text":EMPTY_FALLBACK_TEXT}})
                     _write_frame_obj(self.wfile, {"type":"content_block_stop","index":idx})
