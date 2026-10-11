@@ -517,6 +517,8 @@ REM потолок вывода как у нативного agy (~65536) — д
 set "CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000"
 set "CLAUDE_CODE_ATTRIBUTION_HEADER=0"
 set "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
+REM с 2.1.268 TaskCreate/TodoWrite выдаются только распознанным моделям Claude; у gemini-* их нет без этого флага
+set "CLAUDE_CODE_ENABLE_TODO_TOOLS=1"
 if not "%~1"=="" cd /d "%~1"
 claude --dangerously-skip-permissions
 '''
@@ -538,6 +540,8 @@ export CLAUDE_CODE_AUTO_COMPACT_WINDOW={COMPACT}
 export CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000
 export CLAUDE_CODE_ATTRIBUTION_HEADER=0
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+# с 2.1.268 TaskCreate/TodoWrite выдаются только распознанным моделям Claude; у gemini-* их нет без этого флага
+export CLAUDE_CODE_ENABLE_TODO_TOOLS=1
 TARGET="$1"
 [ -n "$TARGET" ] && cd "$TARGET"
 exec claude --dangerously-skip-permissions
