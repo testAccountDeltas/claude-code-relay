@@ -131,6 +131,45 @@ def set_thinking(body):
     except Exception:
         return body, None
 
+# Обрезка огромных СТАРЫХ tool_result по центру — по мотивам agy.EXE OutputTruncationDecorator
+# (agyCli/docs/17_exact_defaults...md: OutputByteLimit=65536 байт, маркер "truncated from the
+# middle", полный вывод сохраняется на диск). У agy это работает безопасно, потому что ЕГО
+# Read-тул режет вывод ДО того, как модель его увидит, и модель может дочитать по offset;
+# у нас такого канала переполучения нет — поэтому режем ТОЛЬКО messages[:-1] (всё, кроме самого
+# свежего хода), никогда не трогая tool_result, на который модель прямо сейчас отвечает. Старые
+# результаты — чистая context-гигиена, свежие — неприкосновенны. Чистая функция от текста ->
+# детерминирована между повторами одного и того же сообщения -> не бьёт по prefix-кэшу.
+TOOL_OUTPUT_CHAR_LIMIT = 65536  # agy считает байтами; символы — грубый, но безопасный аналог
+def _truncate_middle(text):
+    n = len(text)
+    if n <= TOOL_OUTPUT_CHAR_LIMIT: return text, False
+    half = TOOL_OUTPUT_CHAR_LIMIT // 2
+    marker = f"\n<truncated {n - TOOL_OUTPUT_CHAR_LIMIT} of {n} chars from the middle of the output>\n"
+    return text[:half] + marker + text[-half:], True
+def _shrink_old_tool_results(body):
+    try:
+        j = json.loads(body)
+        msgs = j.get("messages")
+        if not isinstance(msgs, list) or len(msgs) < 2: return body, 0
+        shrunk = 0
+        for msg in msgs[:-1]:  # последний ход не трогаем — модель может его использовать прямо сейчас
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if not isinstance(content, list): continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result": continue
+                bc = block.get("content")
+                if isinstance(bc, str):
+                    new, did = _truncate_middle(bc)
+                    if did: block["content"] = new; shrunk += 1
+                elif isinstance(bc, list):
+                    for part in bc:
+                        if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                            new, did = _truncate_middle(part["text"])
+                            if did: part["text"] = new; shrunk += 1
+        return (json.dumps(j).encode("utf-8"), shrunk) if shrunk else (body, 0)
+    except Exception:
+        return body, 0
+
 _NUDGE = ("IMPORTANT: Produce a visible response now — either a textual answer or a tool "
           "call. Do NOT end your turn with only internal thinking and no output.")
 
@@ -503,6 +542,7 @@ class H(http.server.BaseHTTPRequestHandler):
         body, scrubbed = scrub(raw_body)
         body, remapped = remap_model(body)
         body, think = set_thinking(body)
+        body, shrunk = _shrink_old_tool_results(body)
         meta = summarize_req(body) if "/v1/messages" in self.path else f"bytes={n}"
         rm = f" remap={remapped[0]}->{remapped[1]}" if remapped else ""
         tc = f" think={think[1]}[{think[2]}]" if think else ""
@@ -519,7 +559,8 @@ class H(http.server.BaseHTTPRequestHandler):
         if is_main and _toolcall_check_and_reset(is_main):
             body = _inject_system_text(body, _OSC_NUDGE)
             log(f"[{ts}] #{rid} .. exact tool-call repeat/oscillation -> injecting loop-nudge")
-        log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}){rm}{tc} {meta}{hs}")
+        sk = f" shrunk={shrunk}" if shrunk else ""
+        log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}){rm}{tc} {meta}{hs}{sk}")
 
         fh = {k: v for k, v in self.headers.items()
               if k.lower() not in ("host","content-length","accept-encoding",
