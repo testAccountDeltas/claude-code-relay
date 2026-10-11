@@ -256,13 +256,17 @@ def _detect_exact_loop(history):
             return True
     return False
 def _toolcall_record(is_main, calls, override):
+    # Один элемент истории = один ХОД, не один вызов тула — иначе параллельные тулы за ход
+    # (Read(a.py)+Read(b.py) одним ответом) размазываются по отдельным "звеньям" и забивают
+    # окно истории быстрее, чем кажется (12 звеньев при 2 тулах/ход = 6 ходов, а не 12).
     global _toolcall_hist
     if not is_main: return
     with _loop_lock:
         if override:
             _toolcall_hist = []  # эскейп-тег встречен в тексте -> модель явно подтвердила намеренный повтор
             return
-        _toolcall_hist.extend(calls)
+        if calls:
+            _toolcall_hist.append(tuple(sorted(calls)))
         if len(_toolcall_hist) > TOOLCALL_HIST_MAX: del _toolcall_hist[:-TOOLCALL_HIST_MAX]
 def _toolcall_check_and_reset(is_main):
     if not is_main: return False
