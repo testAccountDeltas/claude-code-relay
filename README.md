@@ -9,6 +9,10 @@ talking to your gateway. Windows & macOS.
 > правый клик по папке → **«Запустить агента здесь»** → Claude Code открывается в этой
 > папке с `--dangerously-skip-permissions`, работая через шлюз на твоей подписке.
 
+<img src="docs/img/subagents-parallel-effort.png" alt="Два суб-агента параллельно, разные уровни /effort" width="700">
+
+*Два суб-агента запущены параллельно, каждый со своим `/effort` (low / high).*
+
 ## Why this exists
 
 A CLIProxyAPI/CliRelay gateway lets you talk to other models (Gemini, GPT, …) through an
@@ -88,11 +92,6 @@ python setup-agent.py
   интерфейса (`CLAUDE_CODE_SIMPLE`) молча отключал суб-агентов, а начиная с Claude Code
   2.1.268 планировщик задач выдаётся только распознанным именам Claude — обе проблемы
   тихие (агент просто делает всё сам, без ошибки), обе сняты.
-
-  <img src="docs/img/subagents-parallel-effort.png" alt="Два суб-агента параллельно, разные уровни /effort" width="700">
-
-  Два суб-агента запущены параллельно, каждый со своим `/effort` (low / high) —
-  именно то, что раньше было недоступно.
 - Создаёт **изолированный профиль** Claude Code (`~/.clirelay-agent/claude-home`) с
   авторизацией по `ANTHROPIC_AUTH_TOKEN` (не `ANTHROPIC_API_KEY` — тот в headless-режиме
   требует интерактивного подтверждения и ломает вход) — твою обычную установку и
