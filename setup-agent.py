@@ -206,18 +206,24 @@ _LOOP_NUDGE = ("Notice from the proxy: you have just made many consecutive Read 
                "to jump straight to the relevant symbol/section, or read the file in much "
                "larger ranges (hundreds of lines) at once, or proceed to answer/edit with what "
                "you already have.")
-def _inject_system_text(body, text):
+# Нудж вставляется синтетическим user-ходом в ХВОСТ messages, а не правкой system.
+# system — вершина prompt-кэша (byte-stable префикс, см. clirelay-read-loop-guard память:
+# 98-99% cache hit всю сессию); дёргая его от случая к случаю, мы сами бьём по кэшу ровно на
+# том ходе, где пытаемся быстро поправить модель. Хвост messages и так меняется каждый ход
+# (туда приходят новые tool_result) — добавление ещё одного сообщения туда кэш не трогает,
+# как у agy (newFallbackUserInputStep — синтетический user-ход, не правка системного промпта).
+def _inject_user_nudge(body, text):
     try:
         j = json.loads(body)
-        sysv = j.get("system")
-        if isinstance(sysv, list): j["system"] = sysv + [{"type": "text", "text": text}]
-        elif isinstance(sysv, str): j["system"] = sysv + "\n\n" + text
-        else: j["system"] = text
-        return json.dumps(j).encode("utf-8")
+        msgs = j.get("messages")
+        if isinstance(msgs, list):
+            j["messages"] = msgs + [{"role": "user", "content": text}]
+            return json.dumps(j).encode("utf-8")
     except Exception:
-        return body
+        pass
+    return body
 def _loop_nudge(body):
-    return _inject_system_text(body, _LOOP_NUDGE)
+    return _inject_user_nudge(body, _LOOP_NUDGE)
 
 # Детектор повтора/осцилляции вызовов тулов (см. logagy.txt, docs/17_exact_defaults_...md
 # в agyCli — agy.EXE's detectLoop[T]): отдельно от read-streak выше, этот ловит ТОЧНЫЙ повтор
@@ -238,13 +244,14 @@ def _canon_tool_key(name, args_obj):
     except Exception:
         return (name or "") + ":" + repr(args_obj)
 def _detect_exact_loop(history):
+    # k=1: тот же вызов x3 подряд; k=2/k=3: осцилляция из 2/3 звеньев (A->B->A->B / A->B->C->A->B->C) x2 цикла
     n = len(history)
-    for period, reps in ((1, 3), (2, 2)):
+    for period, reps in ((1, 3), (2, 2), (3, 2)):
         need = period * reps
         if n < need: continue
         window = history[-need:]
         pattern = window[:period]
-        if len(set(pattern)) < (2 if period == 2 else 1): continue  # k=2 требует A != B, иначе это уже k=1
+        if period > 1 and len(set(pattern)) < period: continue  # вырожденный паттерн -> это уже меньший period
         if all(window[i] == pattern[i % period] for i in range(need)):
             return True
     return False
@@ -266,15 +273,7 @@ def _toolcall_check_and_reset(is_main):
         return False
 
 def _nudge(body):
-    try:
-        j = json.loads(body)
-        sysv = j.get("system")
-        if isinstance(sysv, list): j["system"] = sysv + [{"type": "text", "text": _NUDGE}]
-        elif isinstance(sysv, str): j["system"] = sysv + "\n\n" + _NUDGE
-        else: j["system"] = _NUDGE
-        return json.dumps(j).encode("utf-8")
-    except Exception:
-        return body
+    return _inject_user_nudge(body, _NUDGE)
 
 # Fallback-текст, если даже ретраи дали пустой ход (приём auto_heal у agy):
 EMPTY_FALLBACK_TEXT = "(Пустой ответ модели восстановлен прокси — продолжи или повтори запрос.)"
@@ -445,7 +444,7 @@ def _open_upstream(command, path, body, fh, rid, t0):
             log(f"[{time.strftime('%H:%M:%S')}] #{rid} !! conn err after {dur:.1f}s (att {attempt}): {e!r}")
             if attempt < 5: time.sleep(_backoff_sleep(attempt)); continue
             return None, None
-        if resp.status in (429, 503) and attempt < 3:
+        if resp.status in (429, 503) and attempt < 4:  # agy ModelAPIRetryConfig.MaxRetries=4
             ok_read = True
             try:
                 rb = resp.read()
@@ -557,7 +556,7 @@ class H(http.server.BaseHTTPRequestHandler):
             body = _loop_nudge(body)
             log(f"[{ts}] #{rid} .. read-loop streak >= {LOOP_STREAK_THRESHOLD} -> injecting stop-nudge")
         if is_main and _toolcall_check_and_reset(is_main):
-            body = _inject_system_text(body, _OSC_NUDGE)
+            body = _inject_user_nudge(body, _OSC_NUDGE)
             log(f"[{ts}] #{rid} .. exact tool-call repeat/oscillation -> injecting loop-nudge")
         sk = f" shrunk={shrunk}" if shrunk else ""
         log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}){rm}{tc} {meta}{hs}{sk}")
