@@ -385,7 +385,12 @@ class H(http.server.BaseHTTPRequestHandler):
         meta = summarize_req(body) if "/v1/messages" in self.path else f"bytes={n}"
         rm = f" remap={remapped[0]}->{remapped[1]}" if remapped else ""
         tc = f" think={think[1]}[{think[2]}]" if think else ""
-        log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}){rm}{tc} {meta}")
+        # Заголовки-подсказки шлюзу (CLAUDE_CODE_GATEWAY_HINT_HEADERS=1): различают суб-агента
+        # и родительскую сессию в логе — запросы иначе выглядят одинаково.
+        hint = " ".join(f"{k[14:]}={v}" for k, v in self.headers.items()
+                         if k.lower() in ("x-claude-code-agent-type", "x-claude-code-request-class"))
+        hs = f" [{hint}]" if hint else ""
+        log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}){rm}{tc} {meta}{hs}")
 
         fh = {k: v for k, v in self.headers.items()
               if k.lower() not in ("host","content-length","accept-encoding",
@@ -443,6 +448,7 @@ class H(http.server.BaseHTTPRequestHandler):
             dur = time.time() - t0
             log(f"[{time.strftime('%H:%M:%S')}] #{rid} << SSE done ({dur:.1f}s, empty_retries={eretry}, fallback={injected}, "
                 f"text={final_st['saw_text'] if final_st else '?'}, tool={final_st['saw_tool'] if final_st else '?'}, "
+                f"thinking={final_st['saw_thinking'] if final_st else '?'}, "
                 f"stop={final_st['stop_reason'] if final_st else '?'}"
                 + (f", tool_names={final_st['tool_names']}" if final_st and final_st.get('tool_names') else "")
                 + (f", stream_err={final_st['err']!r}" if final_st and final_st['err'] else "") + ")")
@@ -525,6 +531,8 @@ set "CLAUDE_CODE_ATTRIBUTION_HEADER=0"
 set "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"
 REM с 2.1.268 TaskCreate/TodoWrite выдаются только распознанным моделям Claude; у gemini-* их нет без этого флага
 set "CLAUDE_CODE_ENABLE_TODO_TOOLS=1"
+REM x-claude-code-agent-type / x-claude-code-request-class в заголовках -> видно суб-агентов в логе прокси
+set "CLAUDE_CODE_GATEWAY_HINT_HEADERS=1"
 if not "%~1"=="" cd /d "%~1"
 claude --dangerously-skip-permissions
 '''
@@ -548,6 +556,8 @@ export CLAUDE_CODE_ATTRIBUTION_HEADER=0
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 # с 2.1.268 TaskCreate/TodoWrite выдаются только распознанным моделям Claude; у gemini-* их нет без этого флага
 export CLAUDE_CODE_ENABLE_TODO_TOOLS=1
+# x-claude-code-agent-type / x-claude-code-request-class в заголовках -> видно суб-агентов в логе прокси
+export CLAUDE_CODE_GATEWAY_HINT_HEADERS=1
 TARGET="$1"
 [ -n "$TARGET" ] && cd "$TARGET"
 exec claude --dangerously-skip-permissions
