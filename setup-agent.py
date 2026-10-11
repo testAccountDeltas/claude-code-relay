@@ -35,7 +35,7 @@ PROXY_PY = r'''#!/usr/bin/env python3
 # Фикс-прокси: Claude Code -> сюда -> шлюз. Вырезает system-блок
 # "x-anthropic-billing-header", на котором Gemini-путь шлюза отдаёт 429/503.
 # Стримит SSE, логирует запросы/ответы и отслеживает аномалии (thinking без текста).
-import http.server, http.client, json, time, sys, os, threading
+import http.server, http.client, json, time, sys, os, threading, codecs
 
 UPSTREAM_HOST = "__HOST__"
 UPSTREAM_PORT = __PORT_UP__
@@ -317,11 +317,17 @@ def _stream_one(resp, wfile, offset, suppress_start):
           "stop_reason": None, "max_index": -1, "held": [], "usage": None, "err": None,
           "tool_names": []}
     buf = ""
+    # Инкрементальный декодер: resp.read(8192) режет байты без учёта границ UTF-8 символа
+    # (кириллица = 2 байта и т.п.). decode() на каждом куске ПО ОТДЕЛЬНОСТИ портит символ,
+    # разрезанный между кусками, в "�" — инкрементальный декодер сам буферизует неполный хвост.
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
     try:
         while True:
             chunk = resp.read(8192)
-            if not chunk: break
-            buf += chunk.decode("utf-8", "replace")
+            if not chunk:
+                buf += decoder.decode(b"", final=True)
+                break
+            buf += decoder.decode(chunk)
             frames, buf = _split_frames(buf)
             for frame in frames:
                 if not frame.strip(): continue
