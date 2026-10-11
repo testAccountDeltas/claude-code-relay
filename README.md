@@ -87,6 +87,10 @@ python setup-agent.py
   обрыв не превращается в «агент завис на минуту».
 - Не теряет и не портит кириллицу (и любой многобайтовый текст) в потоковом ответе —
   инкрементальный UTF-8-декодер вместо наивного `decode()` на каждом куске чтения.
+- Держит авто-компакт на потолке **300K токенов** (а не 88% от окна модели, т.е. не
+  880K на 1M-модели) — иначе переписка разрастается в сотни тысяч токенов и каждый
+  ход тормозит вне зависимости от прогретости кэша (подробности и замеры —
+  [ниже](#auto-compact-why-300k-not-1m)).
 - Полный набор инструментов, включая суб-агентов (`Agent`/`Task`, `/agents`) и
   планирование задач (`TaskCreate`/`TaskUpdate`/`TodoWrite`). Ранее режим минимального
   интерфейса (`CLAUDE_CODE_SIMPLE`) молча отключал суб-агентов, а начиная с Claude Code
@@ -104,6 +108,64 @@ python setup-agent.py
   лаунчера и своего пикера моделей, он принимает такой gateway-конфиг на импорт
   (модели там названы `claude-*` — наш же прокси ремапит их в модели шлюза). Прокси
   поднимается сам при входе в систему, в том числе для Desktop.
+
+## Auto-compact: why 300k, not 1M
+
+Claude Code's `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is the model's real, honest context
+window — point it at one huge file/repo in a single turn and it genuinely handles
+all of it. But a long back-and-forth agentic session (dozens of small `Read`/`Edit`
+round-trips) is a different thing: if you let the *rolling conversation* grow toward
+that window before compacting, every turn gets slower, because transformer attention
+cost scales with **total history length**, not with how much of it is prompt-cached.
+
+How compaction actually works — it doesn't touch new work, it folds up old work:
+
+```
+turn 1   turn 2   turn 3   ...   turn N          ←  history keeps growing
+  └────────────┬────────────┘
+       crosses AUTO_COMPACT_WINDOW
+                │
+                ▼
+        model writes a summary of turns 1..N
+        ("explored chats.php, handler at line 970,
+         bug is in function X")
+                │
+                ▼
+[ summary of 1..N ]   turn N+1   turn N+2   ...   ←  fresh turns keep flowing in untouched,
+                                                      only the OLD tail got folded
+```
+
+We measured this live: a session that grew to **570k tokens (99.5% cache hit)** took
+15-53s per turn; right after a manual `/compact` dropped it to **65k tokens (only
+37.5% cache hit — colder, not warmer)**, turns dropped to 3-7s. Worse cache, same
+account, same model — just 9x less raw history — and it got 5-10x faster. That's the
+proof the slowdown was never about caching: it's attention cost over total context
+size. Default Claude Code behavior compacts at ~88% of the context window, which on
+a 1M-token model means waiting until ~880k tokens — by then you've already paid for
+dozens of slow turns. This tool caps the auto-compact threshold at **300k** tokens
+regardless of the model's actual window size, so cleanup happens 3x earlier.
+
+> ### Авто-компакт: почему 300k, а не 1M (RU)
+> `CLAUDE_CODE_MAX_CONTEXT_TOKENS` — честный потолок модели: разовая большая задача
+> (залить файл/репозиторий целиком) реально использует его весь. Но длинный пошаговый
+> диалог (десятки мелких `Read`/`Edit`) — другое дело: если дать **растущей переписке**
+> ползти к этому потолку, каждый ход тормозит всё сильнее, потому что внимание
+> трансформера дорожает с **общим объёмом истории**, а не с тем, сколько из неё взято
+> из кэша.
+>
+> Как на самом деле работает компакт — он не трогает новое, он сворачивает старое:
+> по достижении порога модель сворачивает **старые** ходы в сжатое резюме («исследован
+> chats.php, обработчик на строке 970, проблема в функции X»), подставляет его в начало,
+> а новые ходы продолжают копиться как обычно, НЕ сжимаясь.
+>
+> Замеряли живьём: сессия на **570K токенов (99.5% кэша)** — 15-53с на ход; сразу после
+> ручного `/compact` до **65K токенов (всего 37.5% кэша — холоднее, не теплее!)** — 3-7с
+> на ход. Кэш хуже, аккаунт/модель те же — просто истории в 9 раз меньше — и в 5-10 раз
+> быстрее. Это и доказывает, что тормозило не кэширование, а объём контекста как
+> таковой. Штатно Claude Code компактит на ~88% окна — на 1M-модели это ожидание до
+> ~880K, а к этому моменту уже оплачены десятки медленных ходов. Этот установщик держит
+> порог компакта на **300K** независимо от реального размера окна модели — уборка
+> происходит втрое раньше.
 
 ## Claude Desktop
 
