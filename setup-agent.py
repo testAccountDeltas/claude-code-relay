@@ -99,9 +99,12 @@ def remap_model(body):
 # приходит В КАЖДОМ запросе и это ЯВНЫЙ выбор пользователя -> ПРИОРИТЕТ. Gemini-путь шлюза
 # output_config НЕ читает, поэтому /effort был мёртв — переводим его сами в бюджет-суффикс
 # (в шлюзе суффикс приоритетнее adaptive). EFFORT_MAP: /effort->бюджет; THINK_BY_TIER — запас,
-# если effort нет. agy: low=1000/medium=4000; high ограничили до 24576 (agy -1=безлимит).
-EFFORT_MAP    = {"low": "(1000)", "medium": "(4000)", "high": "(24576)", "xhigh": "(24576)", "max": "(24576)", "ultracode": "(24576)"}
-THINK_BY_TIER = [("-high", "(24576)"), ("-medium", "(4000)"), ("-low", "(1000)")]
+# если effort нет. low было 1000 — по данным стороннего Gemini-шлюза Antigravity Manager
+# (changelog v4.7.5 "Poisonous 1,000-Token Budget", 48 прогонов) бюджет < 2048 обрывает
+# цепочку рассуждений Gemini 3.x целиком; подняли с запасом до 2500. medium=4000;
+# high ограничили до 24576 (agy -1=безлимит).
+EFFORT_MAP    = {"low": "(2500)", "medium": "(4000)", "high": "(24576)", "xhigh": "(24576)", "max": "(24576)", "ultracode": "(24576)"}
+THINK_BY_TIER = [("-high", "(24576)"), ("-medium", "(4000)"), ("-low", "(2500)")]
 THINK_FORCE   = ""        # "" = по effort/тиру; иначе форс всем, напр. "(4000)"
 THINK_DEFAULT = "(4000)"  # ни effort, ни тир не распознаны
 def set_thinking(body):
