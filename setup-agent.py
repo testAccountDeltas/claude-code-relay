@@ -130,6 +130,51 @@ def set_thinking(body):
 
 _NUDGE = ("IMPORTANT: Produce a visible response now — either a textual answer or a tool "
           "call. Do NOT end your turn with only internal thinking and no output.")
+
+# Детектор read-loop: Claude Code режет Read на ~50-100 строк (в отличие от agy, где
+# view_file отдаёт до 800 строк за раз), и после десятка однотипных ходов tool_use:Read ->
+# tool_result модель впадает в авторегрессионный транс — thinking=False, text=False, просто
+# читает следующий кусок. У agy это лечит клиентский loop-guard оркестратора; здесь его нет,
+# поэтому эмулируем то же самое на уровне прокси: считаем streak подряд-идущих "молчаливых"
+# Read-ходов ТОЛЬКО в основном потоке (request-class=main, суб-агентов не трогаем) и один раз
+# впрыскиваем подсказку остановиться.
+LOOP_STREAK_THRESHOLD = 10
+_loop_lock = threading.Lock()
+_loop_streak = 0
+def _loop_record(is_main, tool_names, saw_text, saw_thinking):
+    global _loop_streak
+    if not is_main: return
+    with _loop_lock:
+        if tool_names == ["Read"] and not saw_text and not saw_thinking:
+            _loop_streak += 1
+        else:
+            _loop_streak = 0
+def _loop_check_and_reset(is_main):
+    global _loop_streak
+    if not is_main: return False
+    with _loop_lock:
+        if _loop_streak >= LOOP_STREAK_THRESHOLD:
+            _loop_streak = 0
+            return True
+        return False
+
+_LOOP_NUDGE = ("Notice from the proxy: you have just made many consecutive Read calls on "
+               "small line ranges with no thinking or text in between — this looks like an "
+               "unproductive read-loop over a large file. Stop reading slices. Use Grep/Bash "
+               "to jump straight to the relevant symbol/section, or read the file in much "
+               "larger ranges (hundreds of lines) at once, or proceed to answer/edit with what "
+               "you already have.")
+def _loop_nudge(body):
+    try:
+        j = json.loads(body)
+        sysv = j.get("system")
+        if isinstance(sysv, list): j["system"] = sysv + [{"type": "text", "text": _LOOP_NUDGE}]
+        elif isinstance(sysv, str): j["system"] = sysv + "\n\n" + _LOOP_NUDGE
+        else: j["system"] = _LOOP_NUDGE
+        return json.dumps(j).encode("utf-8")
+    except Exception:
+        return body
+
 def _nudge(body):
     try:
         j = json.loads(body)
@@ -394,6 +439,11 @@ class H(http.server.BaseHTTPRequestHandler):
         hint = " ".join(f"{k[14:]}={v}" for k, v in self.headers.items()
                          if k.lower() in ("x-claude-code-agent-type", "x-claude-code-request-class"))
         hs = f" [{hint}]" if hint else ""
+        req_class = self.headers.get("x-claude-code-request-class")
+        is_main = req_class in (None, "main")  # без заголовка (флаг выключен/другой клиент) считаем основным потоком
+        if is_main and _loop_check_and_reset(is_main):
+            body = _loop_nudge(body)
+            log(f"[{ts}] #{rid} .. read-loop streak >= {LOOP_STREAK_THRESHOLD} -> injecting stop-nudge")
         log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}){rm}{tc} {meta}{hs}")
 
         fh = {k: v for k, v in self.headers.items()
@@ -454,6 +504,8 @@ class H(http.server.BaseHTTPRequestHandler):
             try:
                 for frame in (final_st["held"] if final_st else []): _write_raw(self.wfile, frame)
             except Exception: pass
+            if final_st:
+                _loop_record(is_main, final_st.get("tool_names") or [], final_st["saw_text"], final_st["saw_thinking"])
             dur = time.time() - t0
             log(f"[{time.strftime('%H:%M:%S')}] #{rid} << SSE done ({dur:.1f}s, empty_retries={eretry}, fallback={injected}, "
                 f"text={final_st['saw_text'] if final_st else '?'}, tool={final_st['saw_tool'] if final_st else '?'}, "
