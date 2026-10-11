@@ -167,16 +167,64 @@ _LOOP_NUDGE = ("Notice from the proxy: you have just made many consecutive Read 
                "to jump straight to the relevant symbol/section, or read the file in much "
                "larger ranges (hundreds of lines) at once, or proceed to answer/edit with what "
                "you already have.")
-def _loop_nudge(body):
+def _inject_system_text(body, text):
     try:
         j = json.loads(body)
         sysv = j.get("system")
-        if isinstance(sysv, list): j["system"] = sysv + [{"type": "text", "text": _LOOP_NUDGE}]
-        elif isinstance(sysv, str): j["system"] = sysv + "\n\n" + _LOOP_NUDGE
-        else: j["system"] = _LOOP_NUDGE
+        if isinstance(sysv, list): j["system"] = sysv + [{"type": "text", "text": text}]
+        elif isinstance(sysv, str): j["system"] = sysv + "\n\n" + text
+        else: j["system"] = text
         return json.dumps(j).encode("utf-8")
     except Exception:
         return body
+def _loop_nudge(body):
+    return _inject_system_text(body, _LOOP_NUDGE)
+
+# Детектор повтора/осцилляции вызовов тулов (см. logagy.txt, docs/17_exact_defaults_...md
+# в agyCli — agy.EXE's detectLoop[T]): отдельно от read-streak выше, этот ловит ТОЧНЫЙ повтор
+# одного и того же вызова (tool_name + канонические аргументы) — например, повторный Bash
+# с идентичной падающей командой, или Read/Edit на одном и том же диапазоне. Пороги по
+# мотивам agy: k=1 (один и тот же вызов) x3 подряд, k=2 (осцилляция A->B->A->B) x2 цикла.
+# Эскейп-тег как у agy: модель может явно пометить намеренный повтор, тогда не нуджим.
+TOOLCALL_HIST_MAX = 12
+_OSC_IGNORE_TAG = "[ignoring loop detection]"
+_OSC_NUDGE = ("Your output is flagged for looping content (the exact same tool call, or an "
+              "A/B oscillation, repeated). If this really was intentional, add the tag "
+              + _OSC_IGNORE_TAG + " to your output; otherwise stop and try a fundamentally "
+              "different approach.")
+_toolcall_hist = []  # делит _loop_lock с read-streak выше
+def _canon_tool_key(name, args_obj):
+    try:
+        return (name or "") + ":" + json.dumps(args_obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except Exception:
+        return (name or "") + ":" + repr(args_obj)
+def _detect_exact_loop(history):
+    n = len(history)
+    for period, reps in ((1, 3), (2, 2)):
+        need = period * reps
+        if n < need: continue
+        window = history[-need:]
+        pattern = window[:period]
+        if len(set(pattern)) < (2 if period == 2 else 1): continue  # k=2 требует A != B, иначе это уже k=1
+        if all(window[i] == pattern[i % period] for i in range(need)):
+            return True
+    return False
+def _toolcall_record(is_main, calls, override):
+    global _toolcall_hist
+    if not is_main: return
+    with _loop_lock:
+        if override:
+            _toolcall_hist = []  # эскейп-тег встречен в тексте -> модель явно подтвердила намеренный повтор
+            return
+        _toolcall_hist.extend(calls)
+        if len(_toolcall_hist) > TOOLCALL_HIST_MAX: del _toolcall_hist[:-TOOLCALL_HIST_MAX]
+def _toolcall_check_and_reset(is_main):
+    if not is_main: return False
+    with _loop_lock:
+        if _detect_exact_loop(_toolcall_hist):
+            _toolcall_hist.clear()
+            return True
+        return False
 
 def _nudge(body):
     try:
@@ -365,8 +413,9 @@ def _stream_one(resp, wfile, offset, suppress_start):
     переиндексирует content_block_*; при suppress_start глушит message_start."""
     st = {"saw_text": False, "saw_tool": False, "saw_thinking": False,
           "stop_reason": None, "max_index": -1, "held": [], "usage": None, "err": None,
-          "tool_names": []}
+          "tool_names": [], "tool_calls": [], "text_buf": ""}
     buf = ""
+    _tool_blocks = {}  # idx -> {"name": str, "json": str}  — накопление input_json_delta для детектора повторов
     # Инкрементальный декодер: resp.read(8192) режет байты без учёта границ UTF-8 символа
     # (кириллица = 2 байта и т.п.). decode() на каждом куске ПО ОТДЕЛЬНОСТИ портит символ,
     # разрезанный между кусками, в "�" — инкрементальный декодер сам буферизует неполный хвост.
@@ -395,11 +444,23 @@ def _stream_one(resp, wfile, offset, suppress_start):
                         if bt == "tool_use":
                             st["saw_tool"] = True
                             st["tool_names"].append(cb.get("name"))
+                            _tool_blocks[idx] = {"name": cb.get("name"), "json": ""}
                         elif bt == "thinking": st["saw_thinking"] = True
                     elif typ == "content_block_delta":
                         d = obj.get("delta") or {}
-                        if d.get("type") == "text_delta" and (d.get("text") or "").strip(): st["saw_text"] = True
-                        elif d.get("type") == "thinking_delta": st["saw_thinking"] = True
+                        dtype = d.get("type")
+                        if dtype == "text_delta":
+                            t = d.get("text") or ""
+                            if t.strip(): st["saw_text"] = True
+                            if len(st["text_buf"]) < 4096: st["text_buf"] += t
+                        elif dtype == "thinking_delta": st["saw_thinking"] = True
+                        elif dtype == "input_json_delta" and idx in _tool_blocks:
+                            _tool_blocks[idx]["json"] += d.get("partial_json") or ""
+                    elif typ == "content_block_stop" and idx in _tool_blocks:
+                        tb = _tool_blocks.pop(idx)
+                        try: args_obj = json.loads(tb["json"]) if tb["json"] else {}
+                        except Exception: args_obj = tb["json"]  # невалидный JSON -> хешируем как сырую строку
+                        st["tool_calls"].append(_canon_tool_key(tb["name"], args_obj))
                     if offset: obj["index"] = idx + offset; _write_frame_obj(wfile, obj)
                     else: _write_raw(wfile, frame)
                     continue
@@ -447,6 +508,9 @@ class H(http.server.BaseHTTPRequestHandler):
         if is_main and _loop_check_and_reset(is_main):
             body = _loop_nudge(body)
             log(f"[{ts}] #{rid} .. read-loop streak >= {LOOP_STREAK_THRESHOLD} -> injecting stop-nudge")
+        if is_main and _toolcall_check_and_reset(is_main):
+            body = _inject_system_text(body, _OSC_NUDGE)
+            log(f"[{ts}] #{rid} .. exact tool-call repeat/oscillation -> injecting loop-nudge")
         log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}){rm}{tc} {meta}{hs}")
 
         fh = {k: v for k, v in self.headers.items()
@@ -509,6 +573,9 @@ class H(http.server.BaseHTTPRequestHandler):
             except Exception: pass
             if final_st:
                 _loop_record(is_main, final_st.get("tool_names") or [], final_st["saw_text"], final_st["saw_thinking"])
+                override = _OSC_IGNORE_TAG in (final_st.get("text_buf") or "")
+                _toolcall_record(is_main, final_st.get("tool_calls") or [], override)
+                if override: log(f"[{time.strftime('%H:%M:%S')}] #{rid} .. saw {_OSC_IGNORE_TAG!r} -> loop history reset, not nudging")
             dur = time.time() - t0
             log(f"[{time.strftime('%H:%M:%S')}] #{rid} << SSE done ({dur:.1f}s, empty_retries={eretry}, fallback={injected}, "
                 f"text={final_st['saw_text'] if final_st else '?'}, tool={final_st['saw_tool'] if final_st else '?'}, "
