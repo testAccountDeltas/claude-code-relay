@@ -35,7 +35,7 @@ PROXY_PY = r'''#!/usr/bin/env python3
 # Фикс-прокси: Claude Code -> сюда -> шлюз. Вырезает system-блок
 # "x-anthropic-billing-header", на котором Gemini-путь шлюза отдаёт 429/503.
 # Стримит SSE, логирует запросы/ответы и отслеживает аномалии (thinking без текста).
-import http.server, http.client, json, time, sys, os, threading, codecs
+import http.server, http.client, json, time, sys, os, threading, codecs, random
 
 UPSTREAM_HOST = "__HOST__"
 UPSTREAM_PORT = __PORT_UP__
@@ -99,14 +99,14 @@ def remap_model(body):
 # приходит В КАЖДОМ запросе и это ЯВНЫЙ выбор пользователя -> ПРИОРИТЕТ. Gemini-путь шлюза
 # output_config НЕ читает, поэтому /effort был мёртв — переводим его сами в бюджет-суффикс
 # (в шлюзе суффикс приоритетнее adaptive). EFFORT_MAP: /effort->бюджет; THINK_BY_TIER — запас,
-# если effort нет. low было 1000 — по данным стороннего Gemini-шлюза Antigravity Manager
-# (changelog v4.7.5 "Poisonous 1,000-Token Budget", 48 прогонов) бюджет < 2048 обрывает
-# цепочку рассуждений Gemini 3.x целиком; подняли с запасом до 2500. medium=4000;
-# high ограничили до 24576 (agy -1=безлимит).
-EFFORT_MAP    = {"low": "(2500)", "medium": "(4000)", "high": "(24576)", "xhigh": "(24576)", "max": "(24576)", "ultracode": "(24576)"}
-THINK_BY_TIER = [("-high", "(24576)"), ("-medium", "(4000)"), ("-low", "(2500)")]
-THINK_FORCE   = ""        # "" = по effort/тиру; иначе форс всем, напр. "(4000)"
-THINK_DEFAULT = "(4000)"  # ни effort, ни тир не распознаны
+# если effort нет. Цифры — нативная шкала agy.EXE (effortToThinkingLevel, agyCli/docs/
+# 17_exact_defaults...md): minimal=1024, low=2048, medium=8192, high=16384, xhigh=32768,
+# max=65536. low=2048 совпадает с нижней границей "отравленной зоны" < 2048 у Gemini 3.x
+# (Antigravity Manager, changelog v4.7.5) — не случайность, подтверждает цифры.
+EFFORT_MAP    = {"low": "(2048)", "medium": "(8192)", "high": "(16384)", "xhigh": "(32768)", "max": "(65536)", "ultracode": "(65536)"}
+THINK_BY_TIER = [("-high", "(16384)"), ("-medium", "(8192)"), ("-low", "(2048)")]
+THINK_FORCE   = ""        # "" = по effort/тиру; иначе форс всем, напр. "(8192)"
+THINK_DEFAULT = "(8192)"  # ни effort, ни тир не распознаны
 def set_thinking(body):
     try:
         j = json.loads(body)
@@ -378,6 +378,14 @@ def _write_frame_obj(wfile, obj):
 def _write_raw(wfile, frame):
     wfile.write((frame + "\n\n").encode("utf-8")); wfile.flush()
 
+# Экспоненциальный backoff с джиттером вместо фиксированных sleep(0.5)/sleep(3) — по мотивам
+# agy.EXE ModelAPIRetryConfig (agyCli/docs/17_exact_defaults...md): InitialSleepDurationMs=1000,
+# ExponentialMultiplier=2.0, JitterRange=0.4 (±40%), MaxSleepDurationMs=300000 (5 мин потолок).
+def _backoff_sleep(attempt):
+    base = min(1.0 * (2.0 ** max(attempt - 1, 0)), 300.0)
+    jitter = base * 0.4
+    return max(0.05, base + random.uniform(-jitter, jitter))
+
 def _open_upstream(command, path, body, fh, rid, t0):
     """Открывает апстрим с ретраями (блип связи + 429/503). (conn, resp) или (None, None)."""
     attempt = 0
@@ -396,16 +404,16 @@ def _open_upstream(command, path, body, fh, rid, t0):
             attempt += 1
             dur = time.time() - t0
             log(f"[{time.strftime('%H:%M:%S')}] #{rid} !! conn err after {dur:.1f}s (att {attempt}): {e!r}")
-            if attempt < 5: time.sleep(0.5); continue
+            if attempt < 5: time.sleep(_backoff_sleep(attempt)); continue
             return None, None
         if resp.status in (429, 503) and attempt < 3:
             ok_read = True
             try:
                 rb = resp.read()
-                log(f"[{time.strftime('%H:%M:%S')}] #{rid} -- attempt {attempt+1} -> {resp.status} {resp.reason} ({rb[:120].decode(errors='replace')}), retry in 3s")
+                log(f"[{time.strftime('%H:%M:%S')}] #{rid} -- attempt {attempt+1} -> {resp.status} {resp.reason} ({rb[:120].decode(errors='replace')}), retry in backoff")
             except Exception:
                 ok_read = False  # тело не дочитано -> нельзя реюзать соединение как чистое
-            _release(c, resp, ok=ok_read); attempt += 1; time.sleep(3); continue
+            _release(c, resp, ok=ok_read); attempt += 1; time.sleep(_backoff_sleep(attempt)); continue
         return c, resp
 
 def _stream_one(resp, wfile, offset, suppress_start):
