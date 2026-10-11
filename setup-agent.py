@@ -279,6 +279,18 @@ def _toolcall_check_and_reset(is_main):
 def _nudge(body):
     return _inject_user_nudge(body, _NUDGE)
 
+# agy ModelOutputRetryConfig.ForbidToolUse: на САМОЙ последней попытке пустого хода тулы
+# убираются из запроса целиком — у модели физически нет способа ответить ещё одним тихим
+# tool_use, она обязана выдать текст. Страхует EMPTY_FALLBACK_TEXT ниже, а не подменяет его.
+def _strip_tools(body):
+    try:
+        j = json.loads(body)
+        j.pop("tools", None)
+        j.pop("tool_choice", None)
+        return json.dumps(j).encode("utf-8")
+    except Exception:
+        return body
+
 # Fallback-текст, если даже ретраи дали пустой ход (приём auto_heal у agy):
 EMPTY_FALLBACK_TEXT = "(Пустой ответ модели восстановлен прокси — продолжи или повтори запрос.)"
 def _continue(body):
@@ -368,7 +380,9 @@ class SSETracker:
         return res
 
 _CONNECT_TIMEOUT = 4    # короткий таймаут на connect+TLS: мёртвый SYN (10060) отваливается за ~4с, не за 21с
-_READ_TIMEOUT    = 600  # после установки соединения — длинный таймаут на чтение SSE-стрима
+_TTFT_TIMEOUT    = 60   # таймаут на ПЕРВЫЙ байт тела стрима: мёртвый воркер шлюза виснет молча,
+                        # незачем ждать по нему все 600с — падаем быстро и честно (без звона тишины)
+_READ_TIMEOUT    = 600  # после первого байта — длинный таймаут на чтение остального SSE-стрима
 def _conn():
     cls = http.client.HTTPSConnection if USE_HTTPS else http.client.HTTPConnection
     return cls(UPSTREAM_HOST, UPSTREAM_PORT, timeout=_CONNECT_TIMEOUT)
@@ -435,8 +449,11 @@ def _open_upstream(command, path, body, fh, rid, t0):
         c, reused = _acquire()
         try:
             if not reused:
-                c.connect()                       # форсим connect с коротким таймаутом (_CONNECT_TIMEOUT)
-                c.sock.settimeout(_READ_TIMEOUT)  # после установки — длинный таймаут на чтение стрима
+                c.connect()                        # форсим connect с коротким таймаутом (_CONNECT_TIMEOUT)
+            c.sock.settimeout(_TTFT_TIMEOUT)  # короткий таймаут до первого байта тела; _stream_one
+                                               # сам продлит его до _READ_TIMEOUT после первого чанка.
+                                               # Ставим и на реюзнутых соединениях — иначе унаследуют
+                                               # растянутый _READ_TIMEOUT от предыдущего SSE-стрима.
             c.request(command, path, body=body, headers=fh)
             resp = c.getresponse()
         except Exception as e:
@@ -458,13 +475,14 @@ def _open_upstream(command, path, body, fh, rid, t0):
             _release(c, resp, ok=ok_read); attempt += 1; time.sleep(_backoff_sleep(attempt)); continue
         return c, resp
 
-def _stream_one(resp, wfile, offset, suppress_start):
+def _stream_one(conn, resp, wfile, offset, suppress_start):
     """Стримит один ответ ЖИВЬЁМ, придерживая терминальные кадры; при offset>0
     переиндексирует content_block_*; при suppress_start глушит message_start."""
     st = {"saw_text": False, "saw_tool": False, "saw_thinking": False,
           "stop_reason": None, "max_index": -1, "held": [], "usage": None, "err": None,
           "tool_names": [], "tool_calls": [], "text_buf": ""}
     buf = ""
+    got_first_byte = False
     _tool_blocks = {}  # idx -> {"name": str, "json": str}  — накопление input_json_delta для детектора повторов
     # Инкрементальный декодер: resp.read(8192) режет байты без учёта границ UTF-8 символа
     # (кириллица = 2 байта и т.п.). decode() на каждом куске ПО ОТДЕЛЬНОСТИ портит символ,
@@ -473,6 +491,10 @@ def _stream_one(resp, wfile, offset, suppress_start):
     try:
         while True:
             chunk = resp.read(8192)
+            if not got_first_byte and chunk:
+                got_first_byte = True
+                try: conn.sock.settimeout(_READ_TIMEOUT)  # первый байт пришёл -> снимаем короткий TTFT-таймаут
+                except Exception: pass
             if not chunk:
                 buf += decoder.decode(b"", final=True)
                 break
@@ -592,14 +614,14 @@ class H(http.server.BaseHTTPRequestHandler):
             offset, suppress, eretry, next_idx = 0, False, 0, 0
             final_st = None
             while True:
-                st = _stream_one(cur_resp, self.wfile, offset, suppress)
+                st = _stream_one(cur_conn, cur_resp, self.wfile, offset, suppress)
                 next_idx = max(next_idx, st["max_index"] + 1)  # сквозной счётчик индексов блоков через все сплайсы
                 _release(cur_conn, cur_resp, ok=(st["err"] is None))
                 empty = (not st["saw_text"] and not st["saw_tool"] and st["stop_reason"] == "end_turn")
                 if st["err"] is None and empty and eretry < EMPTY_RETRY_MAX:
                     eretry += 1
                     log(f"[{time.strftime('%H:%M:%S')}] #{rid} .. EMPTY turn -> splice-retry {eretry}/{EMPTY_RETRY_MAX}")
-                    nb = _continue(body if eretry < EMPTY_RETRY_MAX else _nudge(body))
+                    nb = _continue(body) if eretry < EMPTY_RETRY_MAX else _strip_tools(_continue(_nudge(body)))
                     cur_conn, cur_resp = _open_upstream(self.command, self.path, nb, fh, rid, t0)
                     if cur_resp is None or "event-stream" not in (cur_resp.getheader("content-type") or ""):
                         if cur_resp is not None: _release(cur_conn, cur_resp, ok=False)
