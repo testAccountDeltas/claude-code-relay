@@ -81,13 +81,12 @@ def scrub(body):
     return (json.dumps(j).encode("utf-8"), True) if changed else (body, False)
 
 # Gemini плохо справляется со специализированными multi-field тулами (Grep(pattern,path,...),
-# Glob(pattern,path)) — путает value с description/query, роняя InputValidationError
-# ("required parameter pattern is missing"). Подтверждено на том же Gemini в опенкоде
-# (deny grep/glob -> 3/3 без ошибок, см. memory opencode-tool-call-errors) и живьём здесь.
-# Режем их из tools КАЖДЫЙ раз безусловно — модель уходит на один свободный Bash-тул
-# (single command string), с которым Gemini работает надёжно. Безусловно и детерминированно
-# -> не бьёт по prefix-кэшу (в отличие от условных nudge, см. _inject_user_nudge выше).
-DROP_SEARCH_TOOLS = {"Grep", "Glob"}
+# Glob(pattern,path)) — путает value с description/query, роняя InputValidationError.
+# А серверный WebSearch у Anthropic требует бэкенд поиска, которого нет у шлюза CliRelay/Gemini
+# (падает в API Error / malformed response).
+# Режем их из tools КАЖДЫЙ раз безусловно — модель не тратит ходы на падающие инструменты
+# и использует прямые команды (PowerShell / Bash / curl / APIs).
+DROP_SEARCH_TOOLS = {"Grep", "Glob", "WebSearch"}
 def strip_search_tools(body):
     try:
         j = json.loads(body)
