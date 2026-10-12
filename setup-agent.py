@@ -80,6 +80,41 @@ def scrub(body):
         j["system"] = "\n".join(l for l in sysv.splitlines() if MARK not in l); changed = True
     return (json.dumps(j).encode("utf-8"), True) if changed else (body, False)
 
+# Gemini плохо справляется со специализированными multi-field тулами (Grep(pattern,path,...),
+# Glob(pattern,path)) — путает value с description/query, роняя InputValidationError
+# ("required parameter pattern is missing"). Подтверждено на том же Gemini в опенкоде
+# (deny grep/glob -> 3/3 без ошибок, см. memory opencode-tool-call-errors) и живьём здесь.
+# Режем их из tools КАЖДЫЙ раз безусловно — модель уходит на один свободный Bash-тул
+# (single command string), с которым Gemini работает надёжно. Безусловно и детерминированно
+# -> не бьёт по prefix-кэшу (в отличие от условных nudge, см. _inject_user_nudge выше).
+DROP_SEARCH_TOOLS = {"Grep", "Glob"}
+if os.name == "nt":
+    SEARCH_HINT = ("The Grep and Glob tools are not available. To search file contents or find files, "
+                   "use the Bash tool with a single PowerShell command, e.g. "
+                   "Select-String -Path 'dir\\*.ext' -Pattern 'text' -SimpleMatch -Recurse  or  "
+                   "Get-ChildItem -Recurse -Filter '*.ext'. Never call a search tool without all required "
+                   "parameters.")
+else:
+    SEARCH_HINT = ("The Grep and Glob tools are not available. To search file contents or find files, "
+                   "use the Bash tool with a single shell command, e.g. grep -rn \"pattern\" path  or  "
+                   "find . -name '*.ext'  (rg if available). Never call a search tool without all required "
+                   "parameters.")
+def strip_search_tools(body):
+    try:
+        j = json.loads(body)
+        t = j.get("tools")
+        if not isinstance(t, list): return body, False
+        new = [x for x in t if not (isinstance(x, dict) and x.get("name") in DROP_SEARCH_TOOLS)]
+        if len(new) == len(t): return body, False
+        j["tools"] = new
+        sysv = j.get("system")
+        if isinstance(sysv, list): j["system"] = sysv + [{"type": "text", "text": SEARCH_HINT}]
+        elif isinstance(sysv, str): j["system"] = sysv + "\n\n" + SEARCH_HINT
+        else: j["system"] = SEARCH_HINT
+        return json.dumps(j).encode("utf-8"), True
+    except Exception:
+        return body, False
+
 # Ремап claude-имён -> модели шлюза (для Claude Desktop: он требует Anthropic-вид имени,
 # поэтому в inferenceModels задаём claude-* + supports1m, а gemini подставляем здесь).
 # Claude Code не затрагивается — он шлёт gemini-* (префикс не 'claude-').
@@ -568,6 +603,7 @@ class H(http.server.BaseHTTPRequestHandler):
         body, remapped = remap_model(body)
         body, think = set_thinking(body)
         body, shrunk = _shrink_old_tool_results(body)
+        body, stools = strip_search_tools(body)
         meta = summarize_req(body) if "/v1/messages" in self.path else f"bytes={n}"
         rm = f" remap={remapped[0]}->{remapped[1]}" if remapped else ""
         tc = f" think={think[1]}[{think[2]}]" if think else ""
@@ -585,7 +621,8 @@ class H(http.server.BaseHTTPRequestHandler):
             body = _inject_user_nudge(body, _OSC_NUDGE)
             log(f"[{ts}] #{rid} .. exact tool-call repeat/oscillation -> injecting loop-nudge")
         sk = f" shrunk={shrunk}" if shrunk else ""
-        log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}){rm}{tc} {meta}{hs}{sk}")
+        stk = " stools=True" if stools else ""
+        log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}){rm}{tc} {meta}{hs}{sk}{stk}")
 
         fh = {k: v for k, v in self.headers.items()
               if k.lower() not in ("host","content-length","accept-encoding",
