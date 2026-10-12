@@ -782,6 +782,8 @@ REM с 2.1.268 TaskCreate/TodoWrite выдаются только распозн
 set "CLAUDE_CODE_ENABLE_TODO_TOOLS=1"
 REM x-claude-code-agent-type / x-claude-code-request-class в заголовках -> видно суб-агентов в логе прокси
 set "CLAUDE_CODE_GATEWAY_HINT_HEADERS=1"
+REM Родной тул PowerShell (preview) вместо Bash->powershell.exe с кавычко-дабл-врапом
+set "CLAUDE_CODE_USE_POWERSHELL_TOOL=1"
 if not "%~1"=="" cd /d "%~1"
 claude --dangerously-skip-permissions
 '''
