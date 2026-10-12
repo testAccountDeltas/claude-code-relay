@@ -88,24 +88,6 @@ def scrub(body):
 # (single command string), с которым Gemini работает надёжно. Безусловно и детерминированно
 # -> не бьёт по prefix-кэшу (в отличие от условных nudge, см. _inject_user_nudge выше).
 DROP_SEARCH_TOOLS = {"Grep", "Glob"}
-if os.name == "nt":
-    SEARCH_HINT = ("The Grep and Glob tools are not available. To search file contents or find files, "
-                   "use the Bash tool with a single PowerShell command, e.g. "
-                   "Select-String -Path 'dir\\*.ext' -Pattern 'text' -SimpleMatch -Recurse  or  "
-                   "Get-ChildItem -Recurse -Filter '*.ext'. Never call a search tool without all required "
-                   "parameters. IMPORTANT: this runs through a Bash shell wrapping powershell -Command "
-                   "'...' — if the PowerShell command contains a $ (variables like $_, $false, "
-                   "$($_.Path)), wrap the ENTIRE -Command argument in single quotes, not double quotes, "
-                   "otherwise Bash expands the $ before PowerShell ever sees it (e.g. $_.Path silently "
-                   "becomes garbage, -CaseSensitive:$false becomes -CaseSensitive: with a missing argument). "
-                   "If searching for or printing any non-ASCII text (Cyrillic, etc.), start the command with "
-                   "$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new(); — otherwise "
-                   "output piped back through Bash comes out garbled and needs a retry.")
-else:
-    SEARCH_HINT = ("The Grep and Glob tools are not available. To search file contents or find files, "
-                   "use the Bash tool with a single shell command, e.g. grep -rn \"pattern\" path  or  "
-                   "find . -name '*.ext'  (rg if available). Never call a search tool without all required "
-                   "parameters.")
 def strip_search_tools(body):
     try:
         j = json.loads(body)
@@ -114,10 +96,6 @@ def strip_search_tools(body):
         new = [x for x in t if not (isinstance(x, dict) and x.get("name") in DROP_SEARCH_TOOLS)]
         if len(new) == len(t): return body, False
         j["tools"] = new
-        sysv = j.get("system")
-        if isinstance(sysv, list): j["system"] = sysv + [{"type": "text", "text": SEARCH_HINT}]
-        elif isinstance(sysv, str): j["system"] = sysv + "\n\n" + SEARCH_HINT
-        else: j["system"] = SEARCH_HINT
         return json.dumps(j).encode("utf-8"), True
     except Exception:
         return body, False
@@ -786,6 +764,7 @@ REM Родной тул PowerShell (preview) вместо Bash->powershell.exe �
 REM Переменная кроссплатформенная, но на Windows powershell.exe гарантированно есть всегда
 REM (на macOS/Linux нужен pwsh 7+ в PATH — ставим его там условно, см. LAUNCH_SH).
 set "CLAUDE_CODE_USE_POWERSHELL_TOOL=1"
+set "PYTHONIOENCODING=utf-8"
 if not "%~1"=="" cd /d "%~1"
 claude --dangerously-skip-permissions
 '''
