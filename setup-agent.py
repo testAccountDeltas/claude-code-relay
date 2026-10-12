@@ -19,7 +19,7 @@ CliRelay Agent — установщик Claude Code в паре с CliRelay (и�
 
 Требуется: Python 3.8+ и установленный Claude Code (`claude` в PATH).
 """
-import os, sys, json, socket, argparse, urllib.request, urllib.error
+import os, sys, json, socket, argparse, shutil, urllib.request, urllib.error
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -782,7 +782,9 @@ REM с 2.1.268 TaskCreate/TodoWrite выдаются только распозн
 set "CLAUDE_CODE_ENABLE_TODO_TOOLS=1"
 REM x-claude-code-agent-type / x-claude-code-request-class в заголовках -> видно суб-агентов в логе прокси
 set "CLAUDE_CODE_GATEWAY_HINT_HEADERS=1"
-REM Родной тул PowerShell (preview) вместо Bash->powershell.exe с кавычко-дабл-врапом
+REM Родной тул PowerShell (preview) вместо Bash->powershell.exe с кавычко-дабл-врапом.
+REM Переменная кроссплатформенная, но на Windows powershell.exe гарантированно есть всегда
+REM (на macOS/Linux нужен pwsh 7+ в PATH — ставим его там условно, см. LAUNCH_SH).
 set "CLAUDE_CODE_USE_POWERSHELL_TOOL=1"
 if not "%~1"=="" cd /d "%~1"
 claude --dangerously-skip-permissions
@@ -809,6 +811,7 @@ export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 export CLAUDE_CODE_ENABLE_TODO_TOOLS=1
 # x-claude-code-agent-type / x-claude-code-request-class в заголовках -> видно суб-агентов в логе прокси
 export CLAUDE_CODE_GATEWAY_HINT_HEADERS=1
+{PWSH}
 TARGET="$1"
 [ -n "$TARGET" ] && cd "$TARGET"
 exec claude --dangerously-skip-permissions
@@ -1154,13 +1157,18 @@ def do_install():
         install_autostart_windows(HOME / "ensure-proxy.py", pyexe)
     else:
         launcher = HOME / "launch.command"
+        # CLAUDE_CODE_USE_POWERSHELL_TOOL кроссплатформенная (не только Windows-флаг), но на
+        # macOS/Linux требует PowerShell 7+ (`pwsh`) в PATH — без него тул просто не будет
+        # работать. Включаем только если pwsh реально найден на машине устанавливающего.
+        pwsh_line = "export CLAUDE_CODE_USE_POWERSHELL_TOOL=1  # pwsh найден в PATH" if shutil.which("pwsh") else ""
         write(launcher, (LAUNCH_SH
                          .replace("{PYTHON}", pyexe)
                          .replace("{PORT}", str(PROXY_PORT))
                          .replace("{KEY}", key)
                          .replace("{SMALL}", small)
                          .replace("{CTX}", ctx)
-                         .replace("{COMPACT}", compact_str)), executable=True)
+                         .replace("{COMPACT}", compact_str)
+                         .replace("{PWSH}", pwsh_line)), executable=True)
         try: os.chmod(HOME / "config.json", 0o600)
         except Exception: pass
         install_menu_macos()
