@@ -93,7 +93,11 @@ if os.name == "nt":
                    "use the Bash tool with a single PowerShell command, e.g. "
                    "Select-String -Path 'dir\\*.ext' -Pattern 'text' -SimpleMatch -Recurse  or  "
                    "Get-ChildItem -Recurse -Filter '*.ext'. Never call a search tool without all required "
-                   "parameters.")
+                   "parameters. IMPORTANT: this runs through a Bash shell wrapping powershell -Command "
+                   "'...' — if the PowerShell command contains a $ (variables like $_, $false, "
+                   "$($_.Path)), wrap the ENTIRE -Command argument in single quotes, not double quotes, "
+                   "otherwise Bash expands the $ before PowerShell ever sees it (e.g. $_.Path silently "
+                   "becomes garbage, -CaseSensitive:$false becomes -CaseSensitive: with a missing argument).")
 else:
     SEARCH_HINT = ("The Grep and Glob tools are not available. To search file contents or find files, "
                    "use the Bash tool with a single shell command, e.g. grep -rn \"pattern\" path  or  "
