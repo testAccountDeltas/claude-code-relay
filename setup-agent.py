@@ -97,7 +97,10 @@ if os.name == "nt":
                    "'...' — if the PowerShell command contains a $ (variables like $_, $false, "
                    "$($_.Path)), wrap the ENTIRE -Command argument in single quotes, not double quotes, "
                    "otherwise Bash expands the $ before PowerShell ever sees it (e.g. $_.Path silently "
-                   "becomes garbage, -CaseSensitive:$false becomes -CaseSensitive: with a missing argument).")
+                   "becomes garbage, -CaseSensitive:$false becomes -CaseSensitive: with a missing argument). "
+                   "If searching for or printing any non-ASCII text (Cyrillic, etc.), start the command with "
+                   "$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new(); — otherwise "
+                   "output piped back through Bash comes out garbled and needs a retry.")
 else:
     SEARCH_HINT = ("The Grep and Glob tools are not available. To search file contents or find files, "
                    "use the Bash tool with a single shell command, e.g. grep -rn \"pattern\" path  or  "
