@@ -494,12 +494,12 @@ def _open_upstream(command, path, body, fh, rid, t0):
             _release(c, resp, ok=ok_read); attempt += 1; time.sleep(_backoff_sleep(attempt)); continue
         return c, resp
 
-def _stream_one(conn, resp, wfile, offset, suppress_start):
+def _stream_one(conn, resp, wfile, offset, suppress_start, t0=None):
     """Стримит один ответ ЖИВЬЁМ, придерживая терминальные кадры; при offset>0
     переиндексирует content_block_*; при suppress_start глушит message_start."""
     st = {"saw_text": False, "saw_tool": False, "saw_thinking": False,
           "stop_reason": None, "max_index": -1, "held": [], "usage": None, "err": None,
-          "tool_names": [], "tool_calls": [], "text_buf": ""}
+          "tool_names": [], "tool_calls": [], "text_buf": "", "t_first": None}
     buf = ""
     got_first_byte = False
     _tool_blocks = {}  # idx -> {"name": str, "json": str}  — накопление input_json_delta для детектора повторов
@@ -512,6 +512,8 @@ def _stream_one(conn, resp, wfile, offset, suppress_start):
             chunk = resp.read(8192)
             if not got_first_byte and chunk:
                 got_first_byte = True
+                if t0 is not None and st["t_first"] is None:
+                    st["t_first"] = time.time() - t0
                 try: conn.sock.settimeout(_READ_TIMEOUT)  # первый байт пришёл -> снимаем короткий TTFT-таймаут
                 except Exception: pass
             if not chunk:
@@ -635,7 +637,7 @@ class H(http.server.BaseHTTPRequestHandler):
             offset, suppress, eretry, next_idx = 0, False, 0, 0
             final_st = None
             while True:
-                st = _stream_one(cur_conn, cur_resp, self.wfile, offset, suppress)
+                st = _stream_one(cur_conn, cur_resp, self.wfile, offset, suppress, t0=t0)
                 next_idx = max(next_idx, st["max_index"] + 1)  # сквозной счётчик индексов блоков через все сплайсы
                 _release(cur_conn, cur_resp, ok=(st["err"] is None))
                 empty = (not st["saw_text"] and not st["saw_tool"] and st["stop_reason"] == "end_turn")
@@ -672,7 +674,17 @@ class H(http.server.BaseHTTPRequestHandler):
                 _toolcall_record(is_main, final_st.get("tool_calls") or [], override)
                 if override: log(f"[{time.strftime('%H:%M:%S')}] #{rid} .. saw {_OSC_IGNORE_TAG!r} -> loop history reset, not nudging")
             dur = time.time() - t0
-            log(f"[{time.strftime('%H:%M:%S')}] #{rid} << SSE done ({dur:.1f}s, empty_retries={eretry}, fallback={injected}, "
+            t_first = final_st.get("t_first") if final_st else None
+            ttft_s = f"{t_first:.1f}s" if t_first is not None else "?s"
+            gen_s = f"{(dur - t_first):.1f}s" if t_first is not None else "?s"
+            u = (final_st.get("usage") or {}) if final_st else {}
+            u_parts = []
+            if u.get("output_tokens") is not None: u_parts.append(f"out_tok={u['output_tokens']}")
+            if u.get("input_tokens") is not None: u_parts.append(f"in_tok={u['input_tokens']}")
+            if u.get("cache_read_input_tokens") is not None: u_parts.append(f"cache_read={u['cache_read_input_tokens']}")
+            u_str = (", " + ", ".join(u_parts)) if u_parts else ""
+
+            log(f"[{time.strftime('%H:%M:%S')}] #{rid} << SSE done ({dur:.1f}s [ttft={ttft_s}, gen={gen_s}]{u_str}, empty_retries={eretry}, fallback={injected}, "
                 f"text={final_st['saw_text'] if final_st else '?'}, tool={final_st['saw_tool'] if final_st else '?'}, "
                 f"thinking={final_st['saw_thinking'] if final_st else '?'}, "
                 f"stop={final_st['stop_reason'] if final_st else '?'}"
