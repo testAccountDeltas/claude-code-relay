@@ -643,6 +643,7 @@ def _stream_one(conn, resp, wfile, offset, suppress_start, t0=None):
     """Стримит один ответ ЖИВЬЁМ, придерживая терминальные кадры; при offset>0
     переиндексирует content_block_*; при suppress_start глушит message_start."""
     st = {"saw_text": False, "saw_tool": False, "saw_thinking": False,
+          "thinking_chars": 0, "text_chars": 0, "tool_json_chars": 0,
           "stop_reason": None, "max_index": -1, "held": [], "usage": None, "err": None,
           "tool_names": [], "tool_calls": [], "text_buf": "", "t_first": None, "t_content": None}
     buf = ""
@@ -692,10 +693,16 @@ def _stream_one(conn, resp, wfile, offset, suppress_start, t0=None):
                         if dtype == "text_delta":
                             t = d.get("text") or ""
                             if t.strip(): st["saw_text"] = True
+                            st["text_chars"] += len(t)
                             if len(st["text_buf"]) < 4096: st["text_buf"] += t
-                        elif dtype == "thinking_delta": st["saw_thinking"] = True
-                        elif dtype == "input_json_delta" and idx in _tool_blocks:
-                            _tool_blocks[idx]["json"] += d.get("partial_json") or ""
+                        elif dtype == "thinking_delta":
+                            st["saw_thinking"] = True
+                            st["thinking_chars"] += len(d.get("thinking") or "")
+                        elif dtype == "input_json_delta":
+                            pj = d.get("partial_json") or ""
+                            st["tool_json_chars"] += len(pj)
+                            if idx in _tool_blocks:
+                                _tool_blocks[idx]["json"] += pj
                     elif typ == "content_block_stop" and idx in _tool_blocks:
                         tb = _tool_blocks.pop(idx)
                         try: args_obj = json.loads(tb["json"]) if tb["json"] else {}
@@ -837,6 +844,12 @@ class H(http.server.BaseHTTPRequestHandler):
             if u.get("output_tokens") is not None: u_parts.append(f"out_tok={u['output_tokens']}")
             rt = u.get("thinking_tokens") or u.get("reasoning_tokens")
             if rt is not None: u_parts.append(f"reason_tok={rt}")
+            th_c = final_st.get("thinking_chars", 0) if final_st else 0
+            tx_c = final_st.get("text_chars", 0) if final_st else 0
+            tj_c = final_st.get("tool_json_chars", 0) if final_st else 0
+            if th_c > 0: u_parts.append(f"think_chars={th_c}(~{th_c//4}tok)")
+            if tx_c > 0: u_parts.append(f"text_chars={tx_c}")
+            if tj_c > 0: u_parts.append(f"tool_chars={tj_c}")
             if u.get("input_tokens") is not None: u_parts.append(f"in_tok={u['input_tokens']}")
             if u.get("cache_read_input_tokens") is not None: u_parts.append(f"cache_read={u['cache_read_input_tokens']}")
             u_str = (", " + ", ".join(u_parts)) if u_parts else ""
