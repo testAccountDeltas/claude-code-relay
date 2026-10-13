@@ -224,6 +224,45 @@ def remap_model(body):
     except Exception: pass
     return body, None
 
+# Динамический резолвер для виртуальных *-tiered моделей:
+# Позволяет пользователю в Claude Code выбирать "gemini-3.8-flash-tiered" / "gemini-3.7-flash-tiered",
+# а команда /effort (low/medium/high) автоматически переключает реальную целевую модель шлюза:
+#   low    -> *-low (быстрая, бюджет 2k)
+#   medium -> *-medium (сбалансированная, бюджет 8k)
+#   high   -> *-high (глубокие рассуждения, бюджет 16k)
+# Если effort не задан: для 3.8 используется нативный gemini-3.8-flash-tiered (авто-тир Google),
+# для остальных поколений дефолтом выбирается *-medium.
+def resolve_tiered_model(body):
+    try:
+        j = json.loads(body)
+        m = j.get("model")
+        if not isinstance(m, str) or not m.endswith("-tiered"):
+            return body, None
+
+        base = m[:-len("-tiered")]  # напр. "gemini-3.8-flash"
+        eff = (j.get("output_config") or {}).get("effort")
+        if isinstance(eff, str): eff = eff.lower()
+
+        tier_map = {
+            "low": "-low",
+            "medium": "-medium",
+            "high": "-high",
+            "xhigh": "-high",
+            "max": "-high"
+        }
+
+        if eff in tier_map:
+            tgt = base + tier_map[eff]
+        elif base == "gemini-3.8-flash":
+            tgt = "gemini-3.8-flash-tiered"
+        else:
+            tgt = base + "-medium"
+
+        j["model"] = tgt
+        return json.dumps(j).encode("utf-8"), (m, tgt, eff or "auto")
+    except Exception:
+        return body, None
+
 # «Уровень мышления». Claude Code шлёт thinking:{type:"adaptive"}, а уровень усилия — в
 # ОТДЕЛЬНОМ поле output_config.effort (это /effort в CLI: low/medium/high/xhigh/max). Оно
 # приходит В КАЖДОМ запросе и это ЯВНЫЙ выбор пользователя -> ПРИОРИТЕТ. Gemini-путь шлюза
@@ -698,12 +737,14 @@ class H(http.server.BaseHTTPRequestHandler):
         raw_body = self.rfile.read(n) if n else b""
         body, scrubbed = scrub(raw_body)
         body, remapped = remap_model(body)
+        body, tiered = resolve_tiered_model(body)
         body, think = set_thinking(body)
         body, shrunk = _shrink_old_tool_results(body)
         body, stools = strip_search_tools(body)
         body, sanitized = sanitize_messages_for_gemini(body)
         meta = summarize_req(body) if "/v1/messages" in self.path else f"bytes={n}"
         rm = f" remap={remapped[0]}->{remapped[1]}" if remapped else ""
+        tr = f" tiered={tiered[0]}->{tiered[1]}({tiered[2]})" if tiered else ""
         tc = f" think={think[1]}[{think[2]}]" if think else ""
         # Заголовки-подсказки шлюзу (CLAUDE_CODE_GATEWAY_HINT_HEADERS=1): различают суб-агента
         # и родительскую сессию в логе — запросы иначе выглядят одинаково.
@@ -721,7 +762,7 @@ class H(http.server.BaseHTTPRequestHandler):
         sk = f" shrunk={shrunk}" if shrunk else ""
         stk = " stools=True" if stools else ""
         snk = " sanitized=True" if sanitized else ""
-        log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}){rm}{tc} {meta}{hs}{sk}{stk}{snk}")
+        log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}){rm}{tr}{tc} {meta}{hs}{sk}{stk}{snk}")
 
         fh = {k: v for k, v in self.headers.items()
               if k.lower() not in ("host","content-length","accept-encoding",
