@@ -7,3 +7,5 @@ __pycache__/
 *.md
 !README.md
 *.txt
+test_*.py
+simulate_*.py
