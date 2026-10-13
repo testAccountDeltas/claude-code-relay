@@ -608,7 +608,7 @@ def _stream_one(conn, resp, wfile, offset, suppress_start, t0=None):
     переиндексирует content_block_*; при suppress_start глушит message_start."""
     st = {"saw_text": False, "saw_tool": False, "saw_thinking": False,
           "stop_reason": None, "max_index": -1, "held": [], "usage": None, "err": None,
-          "tool_names": [], "tool_calls": [], "text_buf": "", "t_first": None}
+          "tool_names": [], "tool_calls": [], "text_buf": "", "t_first": None, "t_content": None}
     buf = ""
     got_first_byte = False
     _tool_blocks = {}  # idx -> {"name": str, "json": str}  — накопление input_json_delta для детектора повторов
@@ -638,6 +638,8 @@ def _stream_one(conn, resp, wfile, offset, suppress_start, t0=None):
                     if not suppress_start: _write_raw(wfile, frame)
                     continue
                 if typ in ("content_block_start", "content_block_delta", "content_block_stop"):
+                    if t0 is not None and st["t_content"] is None:
+                        st["t_content"] = time.time() - t0
                     idx = obj.get("index", 0)
                     st["max_index"] = max(st["max_index"], idx + offset)
                     if typ == "content_block_start":
@@ -786,16 +788,22 @@ class H(http.server.BaseHTTPRequestHandler):
                 if override: log(f"[{time.strftime('%H:%M:%S')}] #{rid} .. saw {_OSC_IGNORE_TAG!r} -> loop history reset, not nudging")
             dur = time.time() - t0
             t_first = final_st.get("t_first") if final_st else None
+            t_content = final_st.get("t_content") if final_st else None
+            if t_content is None: t_content = t_first
             ttft_s = f"{t_first:.1f}s" if t_first is not None else "?s"
-            gen_s = f"{(dur - t_first):.1f}s" if t_first is not None else "?s"
+            wait_s = f"{(t_content - t_first):.1f}s" if (t_content is not None and t_first is not None) else "0.0s"
+            gen_s = f"{(dur - t_content):.1f}s" if t_content is not None else "?s"
+            timing_s = f"ttft={ttft_s}" + (f"+wait={wait_s}" if (t_content and t_first and t_content - t_first >= 0.5) else "") + f", gen={gen_s}"
             u = (final_st.get("usage") or {}) if final_st else {}
             u_parts = []
             if u.get("output_tokens") is not None: u_parts.append(f"out_tok={u['output_tokens']}")
+            rt = u.get("thinking_tokens") or u.get("reasoning_tokens")
+            if rt is not None: u_parts.append(f"reason_tok={rt}")
             if u.get("input_tokens") is not None: u_parts.append(f"in_tok={u['input_tokens']}")
             if u.get("cache_read_input_tokens") is not None: u_parts.append(f"cache_read={u['cache_read_input_tokens']}")
             u_str = (", " + ", ".join(u_parts)) if u_parts else ""
 
-            log(f"[{time.strftime('%H:%M:%S')}] #{rid} << SSE done ({dur:.1f}s [ttft={ttft_s}, gen={gen_s}]{u_str}, empty_retries={eretry}, fallback={injected}, "
+            log(f"[{time.strftime('%H:%M:%S')}] #{rid} << SSE done ({dur:.1f}s [{timing_s}]{u_str}, empty_retries={eretry}, fallback={injected}, "
                 f"text={final_st['saw_text'] if final_st else '?'}, tool={final_st['saw_tool'] if final_st else '?'}, "
                 f"thinking={final_st['saw_thinking'] if final_st else '?'}, "
                 f"stop={final_st['stop_reason'] if final_st else '?'}"
