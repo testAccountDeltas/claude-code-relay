@@ -711,31 +711,30 @@ def _stream_one(conn, resp, wfile, offset, suppress_start, t0=None):
                                 _tool_blocks[idx] = {"name": cb.get("name"), "json": ""}
                             elif bt == "thinking":
                                 st["saw_thinking"] = True
-                    elif typ == "content_block_delta":
-                        d = obj.get("delta") or {}
-                        dtype = d.get("type")
-                        if dtype == "text_delta":
-                            t = d.get("text") or ""
-                            if t.strip(): st["saw_text"] = True
-                            st["text_chars"] += len(t)
-                            if len(st["text_buf"]) < 4096: st["text_buf"] += t
-                        elif dtype == "thinking_delta":
-                            st["saw_thinking"] = True
-                            st["thinking_chars"] += len(d.get("thinking") or "")
-                        elif dtype == "input_json_delta":
-                            pj = d.get("partial_json") or ""
-                            st["tool_json_chars"] += len(pj)
-                            if idx in _tool_blocks:
-                                _tool_blocks[idx]["json"] += pj
-                    elif typ == "content_block_stop" and idx in _tool_blocks:
-                        tb = _tool_blocks.pop(idx)
-                        try: args_obj = json.loads(tb["json"]) if tb["json"] else {}
-                        except Exception: args_obj = tb["json"]  # невалидный JSON -> хешируем как сырую строку
-                        st["tool_calls"].append(_canon_tool_key(tb["name"], args_obj))
-                    if offset: obj["index"] = idx + offset; _write_frame_obj(wfile, obj)
-                    else: _write_raw(wfile, frame)
-                    continue
-                with wfile_lock:
+                        elif typ == "content_block_delta":
+                            d = obj.get("delta") or {}
+                            dtype = d.get("type")
+                            if dtype == "text_delta":
+                                t = d.get("text") or ""
+                                if t.strip(): st["saw_text"] = True
+                                st["text_chars"] += len(t)
+                                if len(st["text_buf"]) < 4096: st["text_buf"] += t
+                            elif dtype == "thinking_delta":
+                                st["saw_thinking"] = True
+                                st["thinking_chars"] += len(d.get("thinking") or "")
+                            elif dtype == "input_json_delta":
+                                pj = d.get("partial_json") or ""
+                                st["tool_json_chars"] += len(pj)
+                                if idx in _tool_blocks:
+                                    _tool_blocks[idx]["json"] += pj
+                        elif typ == "content_block_stop" and idx in _tool_blocks:
+                            tb = _tool_blocks.pop(idx)
+                            try: args_obj = json.loads(tb["json"]) if tb["json"] else {}
+                            except Exception: args_obj = tb["json"]  # невалидный JSON -> хешируем как сырую строку
+                            st["tool_calls"].append(_canon_tool_key(tb["name"], args_obj))
+                        if offset: obj["index"] = idx + offset; _write_frame_obj(wfile, obj)
+                        else: _write_raw(wfile, frame)
+                        continue
                     if typ == "message_delta":
                         d = obj.get("delta") or {}
                         if "stop_reason" in d: st["stop_reason"] = d.get("stop_reason")
