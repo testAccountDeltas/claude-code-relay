@@ -150,14 +150,13 @@ def set_thinking(body):
     except Exception:
         return body, None
 
-# Обрезка огромных СТАРЫХ tool_result по центру — по мотивам agy.EXE OutputTruncationDecorator
-# (agyCli/docs/17_exact_defaults...md: OutputByteLimit=65536 байт, маркер "truncated from the
-# middle", полный вывод сохраняется на диск). У agy это работает безопасно, потому что ЕГО
-# Read-тул режет вывод ДО того, как модель его увидит, и модель может дочитать по offset;
-# у нас такого канала переполучения нет — поэтому режем ТОЛЬКО messages[:-1] (всё, кроме самого
-# свежего хода), никогда не трогая tool_result, на который модель прямо сейчас отвечает. Старые
-# результаты — чистая context-гигиена, свежие — неприкосновенны. Чистая функция от текста ->
-# детерминирована между повторами одного и того же сообщения -> не бьёт по prefix-кэшу.
+# Немедленная (Eager) обрезка огромных tool_result по центру — по мотивам agy.EXE OutputTruncationDecorator
+# (agyCli/docs/17_exact_defaults...md: OutputByteLimit=65536 байт, маркер "truncated from the middle").
+# ВАЖНО ДЛЯ PROMPT CACHING: обрабатываем ВСЕ сообщения (включая последнее msgs[-1]).
+# Если резать только msgs[:-1], то на следующем ходе сообщение задним числом изменит свой текст
+# и хэш, что вызовет катастрофический сброс всего накопленного KV-кэша (Cache Miss).
+# Обрабатывая все ходы сразу при первом появлении, мы гарантируем Append-Only стабильность:
+# текст усеченного tool_result остается байт-в-байт идентичным на всех последующих ходах сессии.
 TOOL_OUTPUT_CHAR_LIMIT = 65536  # agy считает байтами; символы — грубый, но безопасный аналог
 def _truncate_middle(text):
     n = len(text)
@@ -169,9 +168,9 @@ def _shrink_old_tool_results(body):
     try:
         j = json.loads(body)
         msgs = j.get("messages")
-        if not isinstance(msgs, list) or len(msgs) < 2: return body, 0
+        if not isinstance(msgs, list) or not msgs: return body, 0
         shrunk = 0
-        for msg in msgs[:-1]:  # последний ход не трогаем — модель может его использовать прямо сейчас
+        for msg in msgs:  # Eager: обрабатываем все ходы сразу, чтобы не мутировать историю задним числом
             content = msg.get("content") if isinstance(msg, dict) else None
             if not isinstance(content, list): continue
             for block in content:
