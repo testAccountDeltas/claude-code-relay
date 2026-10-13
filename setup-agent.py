@@ -212,8 +212,16 @@ def sanitize_messages_for_gemini(body_bytes):
 
 # Ремап claude-имён -> модели шлюза (для Claude Desktop: он требует Anthropic-вид имени,
 # поэтому в inferenceModels задаём claude-* + supports1m, а gemini подставляем здесь).
+# Opus маппится в gemini-3.8-flash-tiered, чтобы Claude Desktop также задействовал
+# динамический авто-тир (resolve_tiered_model) в зависимости от ползунка /effort.
 # Claude Code не затрагивается — он шлёт gemini-* (префикс не 'claude-').
-MODEL_MAP = [("claude-opus","gemini-3.8-flash-high"),("claude-fable","gemini-3.8-flash-high"),("claude-mythos","gemini-3.8-flash-high"),("claude-sonnet","gemini-3.8-flash-medium"),("claude-haiku","gemini-3.8-flash-low")]
+MODEL_MAP = [
+    ("claude-opus",   "gemini-3.8-flash-tiered"),
+    ("claude-fable",  "gemini-3.8-flash-tiered"),
+    ("claude-mythos", "gemini-3.8-flash-tiered"),
+    ("claude-sonnet", "gemini-3.8-flash-medium"),
+    ("claude-haiku",  "gemini-3.8-flash-low")
+]
 def remap_model(body):
     try:
         j = json.loads(body); m = j.get("model","")
@@ -231,7 +239,8 @@ def remap_model(body):
 #   medium -> *-medium (сбалансированная, бюджет 8k)
 #   high   -> *-high (глубокие рассуждения, бюджет 16k)
 #   xhigh/max -> нативный gemini-3.8-flash-tiered без скобок: чистый адаптивный режим Google (thinkingBudget=-1)!
-def resolve_tiered_model(body):
+# Для вспомогательных служебных вызовов (request-class=auxiliary) автоматически выбираем *-low.
+def resolve_tiered_model(body, req_class=None):
     try:
         j = json.loads(body)
         m = j.get("model")
@@ -239,6 +248,11 @@ def resolve_tiered_model(body):
             return body, None
 
         base = m[:-len("-tiered")]  # напр. "gemini-3.8-flash"
+        if req_class == "auxiliary":
+            tgt = base + "-low"
+            j["model"] = tgt
+            return json.dumps(j).encode("utf-8"), (m, tgt, "aux:low")
+
         eff = (j.get("output_config") or {}).get("effort")
         if isinstance(eff, str): eff = eff.lower()
 
@@ -268,18 +282,22 @@ def resolve_tiered_model(body):
 #   high   -> бюджет (16384) - расширенный анализ с фиксацией потолка
 #   xhigh/max -> пустой суффикс! Модель остаётся без скобок, шлюз clirelay переходит в ModeAuto
 #               и отправляет в Google thinkingBudget=-1 (настоящий адаптивный авто-тир!).
+# Для auxiliary-запросов (генерация заголовков, краткие резюме) принудительно ставим (2048),
+# предотвращая 18-25с зависания на глубоких скрытых CoT-рассуждениях Google.
 EFFORT_MAP    = {"low": "(2048)", "medium": "(8192)", "high": "(16384)", "xhigh": "", "max": "", "ultracode": ""}
 THINK_BY_TIER = [("-high", "(16384)"), ("-medium", "(8192)"), ("-low", "(2048)")]
 THINK_FORCE   = ""        # "" = по effort/тиру; иначе форс всем, напр. "(8192)"
 THINK_DEFAULT = "(8192)"  # ни effort, ни тир не распознаны
-def set_thinking(body):
+def set_thinking(body, req_class=None):
     try:
         j = json.loads(body)
         m = j.get("model"); th = j.get("thinking")
         if not (isinstance(m, str) and m and not m.endswith(")")
                 and isinstance(th, dict) and th.get("type") in ("adaptive", "enabled")):
             return body, None
-        if THINK_FORCE:
+        if req_class == "auxiliary":
+            sfx, src = "(2048)", "aux:low"
+        elif THINK_FORCE:
             sfx, src = THINK_FORCE, "force"
         else:
             eff = (j.get("output_config") or {}).get("effort")
@@ -338,30 +356,28 @@ def _shrink_old_tool_results(body):
 _NUDGE = ("IMPORTANT: Produce a visible response now — either a textual answer or a tool "
           "call. Do NOT end your turn with only internal thinking and no output.")
 
-# Детектор read-loop: Claude Code режет Read на ~50-100 строк (в отличие от agy, где
-# view_file отдаёт до 800 строк за раз), и после десятка однотипных ходов tool_use:Read ->
-# tool_result модель впадает в авторегрессионный транс — thinking=False, text=False, просто
-# читает следующий кусок. У agy это лечит клиентский loop-guard оркестратора; здесь его нет,
-# поэтому эмулируем то же самое на уровне прокси: считаем streak подряд-идущих "молчаливых"
-# Read-ходов ТОЛЬКО в основном потоке (request-class=main, суб-агентов не трогаем) и один раз
-# впрыскиваем подсказку остановиться.
+# Детектор read-loop (см. logagy.txt): Claude Code режет Read на ~50-100 строк (в отличие
+# от agy, где view_file отдаёт до 800 строк за раз), и после десятка однотипных ходов
+# tool_use:Read -> tool_result модель впадает в авторегрессионный транс — thinking=False,
+# text=False, просто читает следующий кусок. У agy это лечит клиентский loop-guard
+# оркестратора; здесь эмулируем то же самое на уровне прокси.
+# Мультитенантный учёт: считаем независимый streak для основного потока (main) и каждого
+# суб-агента по отдельности (по agent-type и первому user-сообщению).
 LOOP_STREAK_THRESHOLD = 10
 _loop_lock = threading.Lock()
-_loop_streak = 0
-def _loop_record(is_main, tool_names, saw_text, saw_thinking):
-    global _loop_streak
-    if not is_main: return
+_loop_streaks = {}  # agent_key -> int
+def _loop_record(agent_key, tool_names, saw_text, saw_thinking):
+    if not agent_key or agent_key == "auxiliary": return
     with _loop_lock:
         if tool_names == ["Read"] and not saw_text and not saw_thinking:
-            _loop_streak += 1
+            _loop_streaks[agent_key] = _loop_streaks.get(agent_key, 0) + 1
         else:
-            _loop_streak = 0
-def _loop_check_and_reset(is_main):
-    global _loop_streak
-    if not is_main: return False
+            _loop_streaks[agent_key] = 0
+def _loop_check_and_reset(agent_key):
+    if not agent_key or agent_key == "auxiliary": return False
     with _loop_lock:
-        if _loop_streak >= LOOP_STREAK_THRESHOLD:
-            _loop_streak = 0
+        if _loop_streaks.get(agent_key, 0) >= LOOP_STREAK_THRESHOLD:
+            _loop_streaks[agent_key] = 0
             return True
         return False
 
@@ -402,7 +418,7 @@ _OSC_NUDGE = ("Your output is flagged for looping content (the exact same tool c
               "A/B oscillation, repeated). If this really was intentional, add the tag "
               + _OSC_IGNORE_TAG + " to your output; otherwise stop and try a fundamentally "
               "different approach.")
-_toolcall_hist = []  # делит _loop_lock с read-streak выше
+_toolcall_hists = {}  # agent_key -> list of tuples
 def _canon_tool_key(name, args_obj):
     try:
         return (name or "") + ":" + json.dumps(args_obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -420,24 +436,23 @@ def _detect_exact_loop(history):
         if all(window[i] == pattern[i % period] for i in range(need)):
             return True
     return False
-def _toolcall_record(is_main, calls, override):
-    # Один элемент истории = один ХОД, не один вызов тула — иначе параллельные тулы за ход
-    # (Read(a.py)+Read(b.py) одним ответом) размазываются по отдельным "звеньям" и забивают
-    # окно истории быстрее, чем кажется (12 звеньев при 2 тулах/ход = 6 ходов, а не 12).
-    global _toolcall_hist
-    if not is_main: return
+def _toolcall_record(agent_key, calls, override):
+    # Один элемент истории = один ХОД, не один вызов тула
+    if not agent_key or agent_key == 'auxiliary': return
     with _loop_lock:
         if override:
-            _toolcall_hist = []  # эскейп-тег встречен в тексте -> модель явно подтвердила намеренный повтор
+            _toolcall_hists[agent_key] = []
             return
         if calls:
-            _toolcall_hist.append(tuple(sorted(calls)))
-        if len(_toolcall_hist) > TOOLCALL_HIST_MAX: del _toolcall_hist[:-TOOLCALL_HIST_MAX]
-def _toolcall_check_and_reset(is_main):
-    if not is_main: return False
+            h = _toolcall_hists.setdefault(agent_key, [])
+            h.append(tuple(sorted(calls)))
+            if len(h) > TOOLCALL_HIST_MAX: del h[:-TOOLCALL_HIST_MAX]
+def _toolcall_check_and_reset(agent_key):
+    if not agent_key or agent_key == 'auxiliary': return False
     with _loop_lock:
-        if _detect_exact_loop(_toolcall_hist):
-            _toolcall_hist.clear()
+        h = _toolcall_hists.get(agent_key) or []
+        if _detect_exact_loop(h):
+            h.clear()
             return True
         return False
 
@@ -767,11 +782,16 @@ class H(http.server.BaseHTTPRequestHandler):
         if "/v1/v1/" in self.path:
             self.path = self.path.replace("/v1/v1/", "/v1/", 1)  # base_url задан с лишним /v1
         n = int(self.headers.get("Content-Length") or 0)
+        req_class = self.headers.get("x-claude-code-request-class")
+        agent_type = self.headers.get("x-claude-code-agent-type")
+        # Ключ агента для изолированного учёта loop-guard'а: main, subagent(по типу) или сессия
+        agent_key = "auxiliary" if req_class == "auxiliary" else ((f"sub:{agent_type}" if agent_type else "subagent") if req_class == "subagent" else "main")
+
         raw_body = self.rfile.read(n) if n else b""
         body, scrubbed = scrub(raw_body)
         body, remapped = remap_model(body)
-        body, tiered = resolve_tiered_model(body)
-        body, think = set_thinking(body)
+        body, tiered = resolve_tiered_model(body, req_class=req_class)
+        body, think = set_thinking(body, req_class=req_class)
         body, shrunk = _shrink_old_tool_results(body)
         body, stools = strip_search_tools(body)
         body, sanitized = sanitize_messages_for_gemini(body)
@@ -784,14 +804,12 @@ class H(http.server.BaseHTTPRequestHandler):
         hint = " ".join(f"{k[14:]}={v}" for k, v in self.headers.items()
                          if k.lower() in ("x-claude-code-agent-type", "x-claude-code-request-class"))
         hs = f" [{hint}]" if hint else ""
-        req_class = self.headers.get("x-claude-code-request-class")
-        is_main = req_class in (None, "main")  # без заголовка (флаг выключен/другой клиент) считаем основным потоком
-        if is_main and _loop_check_and_reset(is_main):
+        if _loop_check_and_reset(agent_key):
             body = _loop_nudge(body)
-            log(f"[{ts}] #{rid} .. read-loop streak >= {LOOP_STREAK_THRESHOLD} -> injecting stop-nudge")
-        if is_main and _toolcall_check_and_reset(is_main):
+            log(f"[{ts}] #{rid} .. read-loop streak >= {LOOP_STREAK_THRESHOLD} [{agent_key}] -> injecting stop-nudge")
+        if _toolcall_check_and_reset(agent_key):
             body = _inject_user_nudge(body, _OSC_NUDGE)
-            log(f"[{ts}] #{rid} .. exact tool-call repeat/oscillation -> injecting loop-nudge")
+            log(f"[{ts}] #{rid} .. exact tool-call repeat/oscillation [{agent_key}] -> injecting loop-nudge")
         sk = f" shrunk={shrunk}" if shrunk else ""
         stk = " stools=True" if stools else ""
         snk = " sanitized=True" if sanitized else ""
@@ -827,6 +845,20 @@ class H(http.server.BaseHTTPRequestHandler):
                 st = _stream_one(cur_conn, cur_resp, self.wfile, offset, suppress, t0=t0)
                 next_idx = max(next_idx, st["max_index"] + 1)  # сквозной счётчик индексов блоков через все сплайсы
                 _release(cur_conn, cur_resp, ok=(st["err"] is None))
+
+                # Срыв соединения от Google (ConnectionResetError / обрыв до получения контента):
+                # Если в стриме не успели передать контент (saw_text=False, saw_tool=False, saw_thinking=False)
+                # и клиент видел только пинги, безопасно делаем прозрачный ретрай прямо в открытый SSE-поток!
+                can_conn_retry = (st["err"] is not None and not st["saw_text"] and not st["saw_tool"]
+                                  and not st["saw_thinking"] and eretry < EMPTY_RETRY_MAX)
+                if can_conn_retry:
+                    eretry += 1
+                    log(f"[{time.strftime('%H:%M:%S')}] #{rid} !! upstream reset ({st['err']!r}) before content -> transparent SSE retry {eretry}/{EMPTY_RETRY_MAX}")
+                    cur_conn, cur_resp = _open_upstream(self.command, self.path, body, fh, rid, t0)
+                    if cur_resp is not None and "event-stream" in (cur_resp.getheader("content-type") or ""):
+                        offset = next_idx; suppress = True; continue
+                    if cur_resp is not None: _release(cur_conn, cur_resp, ok=False)
+
                 empty = (not st["saw_text"] and not st["saw_tool"] and st["stop_reason"] == "end_turn")
                 if st["err"] is None and empty and eretry < EMPTY_RETRY_MAX:
                     eretry += 1
@@ -856,10 +888,10 @@ class H(http.server.BaseHTTPRequestHandler):
                 for frame in (final_st["held"] if final_st else []): _write_raw(self.wfile, frame)
             except Exception: pass
             if final_st:
-                _loop_record(is_main, final_st.get("tool_names") or [], final_st["saw_text"], final_st["saw_thinking"])
+                _loop_record(agent_key, final_st.get("tool_names") or [], final_st["saw_text"], final_st["saw_thinking"])
                 override = _OSC_IGNORE_TAG in (final_st.get("text_buf") or "")
-                _toolcall_record(is_main, final_st.get("tool_calls") or [], override)
-                if override: log(f"[{time.strftime('%H:%M:%S')}] #{rid} .. saw {_OSC_IGNORE_TAG!r} -> loop history reset, not nudging")
+                _toolcall_record(agent_key, final_st.get("tool_calls") or [], override)
+                if override: log(f"[{time.strftime('%H:%M:%S')}] #{rid} .. saw {_OSC_IGNORE_TAG!r} -> loop history reset [{agent_key}], not nudging")
             dur = time.time() - t0
             t_first = final_st.get("t_first") if final_st else None
             t_content = final_st.get("t_content") if final_st else None
@@ -889,8 +921,13 @@ class H(http.server.BaseHTTPRequestHandler):
             if tx_c > 0: u_parts.append(f"text_chars={tx_c}")
             if tj_c > 0: u_parts.append(f"tool_chars={tj_c}")
             if pings > 0: u_parts.append(f"pings={pings}")
-            if u.get("input_tokens") is not None: u_parts.append(f"in_tok={u['input_tokens']}")
-            if u.get("cache_read_input_tokens") is not None: u_parts.append(f"cache_read={u['cache_read_input_tokens']}")
+            in_tok = u.get("input_tokens")
+            c_read = u.get("cache_read_input_tokens")
+            if in_tok is not None: u_parts.append(f"in_tok={in_tok}")
+            if c_read is not None: u_parts.append(f"cache_read={c_read}")
+            # Явная диагностика холодного преффилла / кэш-промаха на глубокой истории
+            if in_tok is not None and in_tok >= 50000:
+                u_parts.append("CACHE_MISS(cold_prefill)" if (c_read is None or c_read < 50000) else "CACHE_REFILL")
             u_str = (", " + ", ".join(u_parts)) if u_parts else ""
 
             log(f"[{time.strftime('%H:%M:%S')}] #{rid} << SSE done ({dur:.1f}s [{timing_s}]{u_str}, empty_retries={eretry}, fallback={injected}, "
@@ -1348,12 +1385,16 @@ def do_install():
     raw_ctx = int(windows.get(model) or 200000)
     # Оставляем запас под системные промпты и инструменты (~50k), чтобы не упираться в жесткий лимит шлюза
     ctx_val = min(raw_ctx, 1000000) if raw_ctx >= 1000000 else raw_ctx
-    # Авто-компакт на 88% контекста (как раньше) разрастается до сотен тысяч токенов на
-    # 1M-моделях — а внимание трансформера дорожает с объёмом истории независимо от кэша:
-    # даже при 99% прогретом кэше ход на ~570k токенов занимал 15-30с против 3-7с на ~70k
-    # (см. H:\agy\dist, clirelay-read-loop-guard память). Жёсткий потолок 300k — компакт
-    # либо на 88% маленького окна, либо на 300k для больших — что раньше.
-    compact_val = min(int(ctx_val * 0.88), 300000)
+    # Авто-компакт на базе формулы GetDefaultCheckpointConfigForModel из agy.EXE:
+    # Базовый защитный зазор: 40k токенов (как в agy.EXE: cmp rdx, 0x9c40).
+    # Ранее жесткий потолок 300k обрывал непрерывную рабочую цепочку агента при сквозном исследовании кода.
+    # После стабилизации кэша (eager truncation в v1.3.0) и ввода SSE-heartbeat поднимаем порог
+    # до 550k токенов: это сохраняет в 1.8x больше истории без преждевременного lossy-сворачивания
+    # и без задержек внимания (детали в context-compaction-resolution.md).
+    if ctx_val >= 1000000:
+        compact_val = 550000
+    else:
+        compact_val = min(int(ctx_val * 0.85), 300000)
     ctx = str(ctx_val)
     compact_str = str(compact_val)
     pyexe = sys.executable
