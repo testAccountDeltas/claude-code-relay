@@ -226,12 +226,11 @@ def remap_model(body):
 
 # Динамический резолвер для виртуальных *-tiered моделей:
 # Позволяет пользователю в Claude Code выбирать "gemini-3.8-flash-tiered" / "gemini-3.7-flash-tiered",
-# а команда /effort (low/medium/high) автоматически переключает реальную целевую модель шлюза:
+# а команда /effort (low/medium/high/xhigh) переключает реальный режим работы:
 #   low    -> *-low (быстрая, бюджет 2k)
 #   medium -> *-medium (сбалансированная, бюджет 8k)
 #   high   -> *-high (глубокие рассуждения, бюджет 16k)
-# Если effort не задан: для 3.8 используется нативный gemini-3.8-flash-tiered (авто-тир Google),
-# для остальных поколений дефолтом выбирается *-medium.
+#   xhigh/max -> нативный gemini-3.8-flash-tiered без скобок: чистый адаптивный режим Google (thinkingBudget=-1)!
 def resolve_tiered_model(body):
     try:
         j = json.loads(body)
@@ -243,16 +242,15 @@ def resolve_tiered_model(body):
         eff = (j.get("output_config") or {}).get("effort")
         if isinstance(eff, str): eff = eff.lower()
 
-        tier_map = {
-            "low": "-low",
-            "medium": "-medium",
-            "high": "-high",
-            "xhigh": "-high",
-            "max": "-high"
-        }
-
-        if eff in tier_map:
-            tgt = base + tier_map[eff]
+        # xhigh / max для 3.8 — нативный адаптивный авто-тир Google Antigravity
+        if eff in ("xhigh", "max") and base == "gemini-3.8-flash":
+            tgt = "gemini-3.8-flash-tiered"
+        elif eff == "low":
+            tgt = base + "-low"
+        elif eff == "medium":
+            tgt = base + "-medium"
+        elif eff in ("high", "xhigh", "max"):
+            tgt = base + "-high"
         elif base == "gemini-3.8-flash":
             tgt = "gemini-3.8-flash-tiered"
         else:
@@ -264,15 +262,13 @@ def resolve_tiered_model(body):
         return body, None
 
 # «Уровень мышления». Claude Code шлёт thinking:{type:"adaptive"}, а уровень усилия — в
-# ОТДЕЛЬНОМ поле output_config.effort (это /effort в CLI: low/medium/high/xhigh/max). Оно
-# приходит В КАЖДОМ запросе и это ЯВНЫЙ выбор пользователя -> ПРИОРИТЕТ. Gemini-путь шлюза
-# output_config НЕ читает, поэтому /effort был мёртв — переводим его сами в бюджет-суффикс
-# (в шлюзе суффикс приоритетнее adaptive). EFFORT_MAP: /effort->бюджет; THINK_BY_TIER — запас,
-# если effort нет. Цифры — нативная шкала agy.EXE (effortToThinkingLevel, agyCli/docs/
-# 17_exact_defaults...md): minimal=1024, low=2048, medium=8192, high=16384, xhigh=32768,
-# max=65536. low=2048 совпадает с нижней границей "отравленной зоны" < 2048 у Gemini 3.x
-# (Antigravity Manager, changelog v4.7.5) — не случайность, подтверждает цифры.
-EFFORT_MAP    = {"low": "(2048)", "medium": "(8192)", "high": "(16384)", "xhigh": "(32768)", "max": "(65536)", "ultracode": "(65536)"}
+# ОТДЕЛЬНОМ поле output_config.effort (это и есть /effort в CLI: low/medium/high/xhigh/max).
+#   low    -> бюджет (2048)
+#   medium -> бюджет (8192) - безопасный боевой дефолт
+#   high   -> бюджет (16384) - расширенный анализ с фиксацией потолка
+#   xhigh/max -> пустой суффикс! Модель остаётся без скобок, шлюз clirelay переходит в ModeAuto
+#               и отправляет в Google thinkingBudget=-1 (настоящий адаптивный авто-тир!).
+EFFORT_MAP    = {"low": "(2048)", "medium": "(8192)", "high": "(16384)", "xhigh": "", "max": "", "ultracode": ""}
 THINK_BY_TIER = [("-high", "(16384)"), ("-medium", "(8192)"), ("-low", "(2048)")]
 THINK_FORCE   = ""        # "" = по effort/тиру; иначе форс всем, напр. "(8192)"
 THINK_DEFAULT = "(8192)"  # ни effort, ни тир не распознаны
@@ -288,13 +284,14 @@ def set_thinking(body):
         else:
             eff = (j.get("output_config") or {}).get("effort")
             if isinstance(eff, str) and eff.lower() in EFFORT_MAP:
-                sfx, src = EFFORT_MAP[eff.lower()], "effort:" + eff.lower()
+                sfx = EFFORT_MAP[eff.lower()]
+                src = "effort:" + eff.lower() if sfx else "adaptive:auto(-1)"
             else:
                 sfx, src = THINK_DEFAULT, "default"
                 for tier, s in THINK_BY_TIER:
                     if m.endswith(tier): sfx, src = s, "tier" + tier; break
         if not sfx:
-            return body, None
+            return body, (m, m, src)
         j["model"] = m + sfx
         return json.dumps(j).encode("utf-8"), (m, j["model"], src)
     except Exception:
