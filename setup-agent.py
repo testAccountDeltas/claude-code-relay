@@ -657,9 +657,12 @@ def _stream_one(conn, resp, wfile, offset, suppress_start, t0=None):
 
     stop_heartbeat = threading.Event()
     wfile_lock = threading.Lock()
+    last_chunk_time = [time.time()]
 
     def _heartbeat_worker():
         while not stop_heartbeat.wait(_PING_INTERVAL):
+            if time.time() - last_chunk_time[0] < _PING_INTERVAL:
+                continue
             with wfile_lock:
                 try:
                     wfile.write(b"event: ping\ndata: {\"type\":\"ping\"}\n\n")
@@ -677,9 +680,9 @@ def _stream_one(conn, resp, wfile, offset, suppress_start, t0=None):
     try:
         while True:
             chunk = resp.read(8192)
+            last_chunk_time[0] = time.time()  # сбрасываем idle-таймер на каждом поступившем чанке
             if not got_first_byte and chunk:
                 got_first_byte = True
-                stop_heartbeat.set()  # первый байт пришёл -> останавливаем фоновый ping
                 if t0 is not None and st["t_first"] is None:
                     st["t_first"] = time.time() - t0
                 try: conn.sock.settimeout(_READ_TIMEOUT)  # первый байт пришёл -> снимаем короткий TTFT-таймаут
@@ -867,13 +870,21 @@ class H(http.server.BaseHTTPRequestHandler):
             timing_s = f"ttft={ttft_s}" + (f"+wait={wait_s}" if (t_content and t_first and t_content - t_first >= 0.5) else "") + f", gen={gen_s}"
             u = (final_st.get("usage") or {}) if final_st else {}
             u_parts = []
-            if u.get("output_tokens") is not None: u_parts.append(f"out_tok={u['output_tokens']}")
-            rt = u.get("thinking_tokens") or u.get("reasoning_tokens")
-            if rt is not None: u_parts.append(f"reason_tok={rt}")
             th_c = final_st.get("thinking_chars", 0) if final_st else 0
             tx_c = final_st.get("text_chars", 0) if final_st else 0
             tj_c = final_st.get("tool_json_chars", 0) if final_st else 0
             pings = final_st.get("pings_sent", 0) if final_st else 0
+
+            out_tok = u.get("output_tokens")
+            if out_tok is not None:
+                vis_tok = th_c // 4 + tx_c // 4 + tj_c // 4
+                hid_tok = max(0, out_tok - vis_tok)
+                if hid_tok > 0 and vis_tok > 0:
+                    u_parts.append(f"out_tok={out_tok}(vis~{vis_tok},hid~{hid_tok})")
+                else:
+                    u_parts.append(f"out_tok={out_tok}")
+            rt = u.get("thinking_tokens") or u.get("reasoning_tokens")
+            if rt is not None: u_parts.append(f"reason_tok={rt}")
             if th_c > 0: u_parts.append(f"think_chars={th_c}(~{th_c//4}tok)")
             if tx_c > 0: u_parts.append(f"text_chars={tx_c}")
             if tj_c > 0: u_parts.append(f"tool_chars={tj_c}")
