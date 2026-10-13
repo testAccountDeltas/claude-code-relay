@@ -1015,9 +1015,9 @@ def model_slots(default_model, models):
     Если шлюз отдает другие суффиксы — аккуратно подбираем high/medium/low."""
     has_tiered = any("-tiered" in m for m in models) if models else False
     if has_tiered or "-tiered" in default_model:
-        high = next((m for m in ("gemini-3.8-flash-tiered", "gemini-3.7-flash-tiered") if m in models), default_model)
-        med = next((m for m in ("gemini-3.7-flash-tiered", "gemini-3.8-flash-tiered") if m in models), default_model)
-        low = next((m for m in ("gemini-3.6-flash-tiered", "gemini-3.8-flash-low", "gemini-3.7-flash-tiered") if m in models), default_model)
+        high = next((m for m in ("gemini-3.8-flash-tiered", "gemini-3.8-flash-high") if m in models), default_model)
+        med = next((m for m in ("gemini-3.7-flash-tiered", "gemini-3.8-flash-medium", "gemini-3.8-flash-tiered") if m in models), default_model)
+        low = next((m for m in ("gemini-3.6-flash-tiered", "gemini-3.8-flash-low", "gemini-3.5-flash-low") if m in models), default_model)
         return high, med, low
 
     base = default_model
