@@ -560,9 +560,9 @@ class SSETracker:
         return res
 
 _CONNECT_TIMEOUT = 4    # короткий таймаут на connect+TLS: мёртвый SYN (10060) отваливается за ~4с, не за 21с
-_TTFT_TIMEOUT    = 60   # таймаут на ПЕРВЫЙ байт тела стрима: мёртвый воркер шлюза виснет молча,
-                        # незачем ждать по нему все 600с — падаем быстро и честно (без звона тишины)
+_TTFT_TIMEOUT    = 180  # таймаут на ПЕРВЫЙ байт тела стрима: 180с под длинные генерации файлов Google и очереди Borg
 _READ_TIMEOUT    = 600  # после первого байта — длинный таймаут на чтение остального SSE-стрима
+_PANIC_TIMEOUT   = 30.0 # порог паники: если апстрим молчит 30с, шлём клиенту ранние SSE-заголовки и пинг (защита от 45с таймаута Claude Code)
 def _conn():
     cls = http.client.HTTPSConnection if USE_HTTPS else http.client.HTTPConnection
     return cls(UPSTREAM_HOST, UPSTREAM_PORT, timeout=_CONNECT_TIMEOUT)
@@ -820,10 +820,80 @@ class H(http.server.BaseHTTPRequestHandler):
                                     "connection","keep-alive","proxy-connection","te","upgrade")}
         fh["Host"] = UPSTREAM_HOST
 
-        conn, resp = _open_upstream(self.command, self.path, body, fh, rid, t0)
+        is_stream_req = False
+        try:
+            _jd = json.loads(body)
+            is_stream_req = bool(_jd.get("stream"))
+        except Exception:
+            pass
+
+        early_headers_sent = False
+        wfile_lock = threading.Lock()
+        conn = None
+        resp = None
+
+        if is_stream_req:
+            # Асинхронное открытие апстрима со сторожевым таймером паники (30с)
+            res_box = [None, None]  # [conn, resp]
+            err_box = [None]
+            done_evt = threading.Event()
+
+            def _upstream_worker():
+                try:
+                    c, r = _open_upstream(self.command, self.path, body, fh, rid, t0)
+                    res_box[0], res_box[1] = c, r
+                except Exception as ex:
+                    err_box[0] = ex
+                finally:
+                    done_evt.set()
+
+            up_th = threading.Thread(target=_upstream_worker, daemon=True)
+            up_th.start()
+
+            # Ждём ответ до _PANIC_TIMEOUT (30с)
+            if not done_evt.wait(_PANIC_TIMEOUT):
+                # Порог паники: апстрим молчит >= 30с. Клиент Claude Code отвалится на 45с,
+                # поэтому немедленно отдаём клиенту ранние заголовки 200 OK и шлём пинги!
+                log(f"[{ts}] #{rid} .. upstream TTFT >= {_PANIC_TIMEOUT:.0f}s -> panicking: early SSE headers + keepalive ping")
+                try:
+                    with wfile_lock:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        self.wfile.write(b"event: ping\ndata: {\"type\":\"ping\"}\n\n")
+                        self.wfile.flush()
+                    early_headers_sent = True
+                    self.close_connection = True
+                except Exception as ex:
+                    log(f"[{ts}] #{rid} !! client socket failed during panic headers: {ex!r}")
+
+                # Периодически шлём пинг каждые 30с до прихода ответа апстрима
+                while not done_evt.wait(_PANIC_TIMEOUT):
+                    if early_headers_sent:
+                        try:
+                            with wfile_lock:
+                                self.wfile.write(b"event: ping\ndata: {\"type\":\"ping\"}\n\n")
+                                self.wfile.flush()
+                        except Exception:
+                            break
+
+            conn, resp = res_box[0], res_box[1]
+        else:
+            conn, resp = _open_upstream(self.command, self.path, body, fh, rid, t0)
+
         if resp is None:
-            try: self.send_error(502, "upstream error")
-            except Exception: pass
+            if not early_headers_sent:
+                try: self.send_error(502, "upstream error")
+                except Exception: pass
+            else:
+                try:
+                    with wfile_lock:
+                        err_payload = json.dumps({"type":"error","error":{"type":"api_error","message":"Upstream error"}})
+                        self.wfile.write(f"event: error\ndata: {err_payload}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                except Exception: pass
             return
 
         ctype = resp.getheader("content-type") or ""
@@ -832,11 +902,12 @@ class H(http.server.BaseHTTPRequestHandler):
             # (thinking виден сразу), но придерживаем терминальные кадры. Если ход вышел
             # пустым (0 текста, 0 тулов, end_turn) — переоткрываем апстрим и доклеиваем
             # ответ в тот же поток. Ошибка парсинга/склейки -> отдаём придержанное как есть.
-            self.send_response(200)
-            for k, v in resp.getheaders():
-                if k.lower() not in HOP: self.send_header(k, v)
-            self.send_header("Connection", "close"); self.end_headers()
-            self.close_connection = True
+            if not early_headers_sent:
+                self.send_response(200)
+                for k, v in resp.getheaders():
+                    if k.lower() not in HOP: self.send_header(k, v)
+                self.send_header("Connection", "close"); self.end_headers()
+                self.close_connection = True
 
             cur_conn, cur_resp = conn, resp
             offset, suppress, eretry, next_idx = 0, False, 0, 0
