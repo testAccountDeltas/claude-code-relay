@@ -99,6 +99,117 @@ def strip_search_tools(body):
     except Exception:
         return body, False
 
+# Санитайзер структуры запроса messages для Gemini:
+# Предотвращает HTTP 400 INVALID_ARGUMENT при повреждении сессии, сбоях compaction,
+# пустых текстовых блоках или повисших вызовах инструментов tool_use.
+def sanitize_messages_for_gemini(body_bytes):
+    try:
+        j = json.loads(body_bytes)
+        msgs = j.get("messages")
+        if not isinstance(msgs, list) or not msgs:
+            return body_bytes, False
+
+        fixed_any = False
+        new_msgs = []
+
+        # 1. Нормализация блоков контента
+        for m in msgs:
+            if not isinstance(m, dict): continue
+            role = m.get("role", "user")
+            content = m.get("content")
+
+            if isinstance(content, str):
+                if not content.strip():
+                    content = "..."
+                    fixed_any = True
+                norm_blocks = [{"type": "text", "text": content}]
+            elif isinstance(content, list):
+                norm_blocks = []
+                for b in content:
+                    if not isinstance(b, dict): continue
+                    if b.get("type") == "text":
+                        t = b.get("text", "")
+                        if not t or not t.strip():
+                            fixed_any = True
+                            continue  # удаляем пустые текстовые блоки
+                        norm_blocks.append(b)
+                    else:
+                        norm_blocks.append(b)
+                if not norm_blocks:
+                    norm_blocks = [{"type": "text", "text": "..."}]
+                    fixed_any = True
+            else:
+                norm_blocks = [{"type": "text", "text": "..."}]
+                fixed_any = True
+
+            new_msgs.append({"role": role, "content": norm_blocks})
+
+        if not new_msgs:
+            return body_bytes, False
+
+        # 2. Первое сообщение обязано быть от user
+        if new_msgs[0]["role"] != "user":
+            new_msgs.insert(0, {"role": "user", "content": [{"type": "text", "text": "Continue."}]})
+            fixed_any = True
+
+        # 3. Склейка идущих подряд сообщений одной роли
+        merged = []
+        for m in new_msgs:
+            if merged and merged[-1]["role"] == m["role"]:
+                merged[-1]["content"].extend(m["content"])
+                fixed_any = True
+            else:
+                merged.append(m)
+        new_msgs = merged
+
+        # 4. Проверка и согласование пар tool_use / tool_result
+        tool_uses_seen = set()
+        tool_results_seen = set()
+        for m in new_msgs:
+            for b in m["content"]:
+                if b.get("type") == "tool_use" and b.get("id"):
+                    tool_uses_seen.add(b["id"])
+                elif b.get("type") == "tool_result" and b.get("tool_use_id"):
+                    tool_results_seen.add(b["tool_use_id"])
+
+        # Превращаем осиротевшие tool_result в текст
+        for m in new_msgs:
+            for b in m["content"]:
+                if b.get("type") == "tool_result":
+                    tid = b.get("tool_use_id")
+                    if tid not in tool_uses_seen:
+                        b["type"] = "text"
+                        c = b.pop("content", "")
+                        b["text"] = f"[Tool output {tid}]: {c}" if isinstance(c, str) else "[Tool output]"
+                        b.pop("tool_use_id", None)
+                        fixed_any = True
+
+        # Закрываем повисшие tool_use синтетическими ответами
+        unanswered = {}
+        for m in new_msgs:
+            if m["role"] == "assistant":
+                for b in m["content"]:
+                    if b.get("type") == "tool_use" and b.get("id"):
+                        if b["id"] not in tool_results_seen:
+                            unanswered[b["id"]] = b.get("name", "tool")
+
+        if unanswered:
+            synth = [{"type": "tool_result", "tool_use_id": tid, "content": "(recovered by proxy)"}
+                     for tid in unanswered]
+            if new_msgs[-1]["role"] == "assistant":
+                new_msgs.append({"role": "user", "content": synth})
+            else:
+                for s in synth:
+                    new_msgs[-1]["content"].insert(0, s)
+            fixed_any = True
+
+        if fixed_any:
+            j["messages"] = new_msgs
+            return json.dumps(j).encode("utf-8"), True
+        return body_bytes, False
+    except Exception:
+        return body_bytes, False
+
 # Ремап claude-имён -> модели шлюза (для Claude Desktop: он требует Anthropic-вид имени,
 # поэтому в inferenceModels задаём claude-* + supports1m, а gemini подставляем здесь).
 # Claude Code не затрагивается — он шлёт gemini-* (префикс не 'claude-').
@@ -588,6 +699,7 @@ class H(http.server.BaseHTTPRequestHandler):
         body, think = set_thinking(body)
         body, shrunk = _shrink_old_tool_results(body)
         body, stools = strip_search_tools(body)
+        body, sanitized = sanitize_messages_for_gemini(body)
         meta = summarize_req(body) if "/v1/messages" in self.path else f"bytes={n}"
         rm = f" remap={remapped[0]}->{remapped[1]}" if remapped else ""
         tc = f" think={think[1]}[{think[2]}]" if think else ""
@@ -606,7 +718,8 @@ class H(http.server.BaseHTTPRequestHandler):
             log(f"[{ts}] #{rid} .. exact tool-call repeat/oscillation -> injecting loop-nudge")
         sk = f" shrunk={shrunk}" if shrunk else ""
         stk = " stools=True" if stools else ""
-        log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}){rm}{tc} {meta}{hs}{sk}{stk}")
+        snk = " sanitized=True" if sanitized else ""
+        log(f"[{ts}] #{rid} >> {self.command} {self.path} (scrub={scrubbed}){rm}{tc} {meta}{hs}{sk}{stk}{snk}")
 
         fh = {k: v for k, v in self.headers.items()
               if k.lower() not in ("host","content-length","accept-encoding",
