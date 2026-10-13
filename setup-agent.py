@@ -1003,14 +1003,23 @@ def fetch_models(base, key):
         return [], {}
 
 def pick_default_model(models):
-    for pref in ("gemini-3.8-flash-medium", "gemini-3.8-flash-low"):
+    for pref in ("gemini-3.8-flash-tiered", "gemini-3.8-flash-medium", "gemini-3.8-flash-low"):
         if pref in models: return pref
     for m in models:
         if "flash" in m and "gemini" in m: return m
-    return models[0] if models else "gemini-3.8-flash-medium"
+    return models[0] if models else "gemini-3.8-flash-tiered"
 
 def model_slots(default_model, models):
-    """Три слота пикатора: Opus=high, Sonnet=default, Haiku=low (по варианту суффикса)."""
+    """Три слота пикера: Opus, Sonnet, Haiku.
+    Приоритет отдаем проверенным tiered-моделям (3.8 -> Opus, 3.7 -> Sonnet, 3.6 -> Haiku).
+    Если шлюз отдает другие суффиксы — аккуратно подбираем high/medium/low."""
+    has_tiered = any("-tiered" in m for m in models) if models else False
+    if has_tiered or "-tiered" in default_model:
+        high = next((m for m in ("gemini-3.8-flash-tiered", "gemini-3.7-flash-tiered") if m in models), default_model)
+        med = next((m for m in ("gemini-3.7-flash-tiered", "gemini-3.8-flash-tiered") if m in models), default_model)
+        low = next((m for m in ("gemini-3.6-flash-tiered", "gemini-3.8-flash-low", "gemini-3.7-flash-tiered") if m in models), default_model)
+        return high, med, low
+
     base = default_model
     for suf in ("-high", "-medium", "-low", "-tiered", "-extra-low"):
         if base.endswith(suf): base = base[: -len(suf)]; break
@@ -1021,6 +1030,8 @@ def model_slots(default_model, models):
 
 def pick_extra(models, used):
     """Доп. именованный пункт (ANTHROPIC_CUSTOM_MODEL_OPTION): предпочитаем pro-модель."""
+    for pref in ("gemini-3.1-pro-low", "gemini-3.1-pro-medium", "gemini-2.5-pro"):
+        if pref in (models or []) and pref not in used: return pref
     for m in (models or []):
         if m not in used and "pro" in m: return m
     for m in (models or []):
@@ -1033,20 +1044,23 @@ def build_settings(default_model, models):
     (способ через ANTHROPIC_DEFAULT_*_MODEL + ANTHROPIC_CUSTOM_MODEL_OPTION)."""
     high, med, low = model_slots(default_model, models)
     env = {
-        "ANTHROPIC_DEFAULT_OPUS_MODEL":   high,   # слот Opus   -> high
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": med,    # слот Sonnet -> default
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL":  low,    # слот Haiku  -> low
+        "ANTHROPIC_DEFAULT_OPUS_MODEL":   high,   # слот Opus   -> флагман
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": med,    # слот Sonnet -> сбалансированная
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL":  low,    # слот Haiku  -> быстрая
     }
     extra = pick_extra(models, {high, med, low})
     if extra:
         env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = extra
         env["ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"] = extra
-        env["ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION"] = extra
-    fb = [med] + ([low] if low and low != med else [])   # сперва medium, потом low
+        desc = "Gemini Pro (low)" if "low" in extra else ("Gemini Pro" if "pro" in extra else extra)
+        env["ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION"] = desc
+    fb = [high] + ([med] if med and med != high else [])
     s = {
         "env": env,
-        "model": "sonnet",                 # дефолт -> слот Sonnet (= default model, medium)
-        "fallbackModel": fb,               # при проблемах основной — на medium, затем low
+        "model": "opus",
+        "fallbackModel": fb,
+        "language": "Russia",
+        "effortLevel": "medium",
         "skipDangerousModePermissionPrompt": True,
     }
     return s, (high, med, low, extra)
@@ -1296,8 +1310,8 @@ def do_install():
     print(f"  Claude Desktop: импортируй {desktop_import}")
     print("    (Desktop -> настройки стороннего gateway -> вставить этот JSON; уровень мышления — его /effort).")
     print("\n  Модели в пикере /model (по именам, переключение прямо в сессии):")
-    print(f"      Opus   -> {m_high}")
-    print(f"      Sonnet -> {m_med}   (дефолт)")
+    print(f"      Opus   -> {m_high}   (дефолт)")
+    print(f"      Sonnet -> {m_med}")
     print(f"      Haiku  -> {m_low}")
     if m_extra: print(f"      +доп.  -> {m_extra}")
     print("      Любая другая: /model -> Custom -> впиши id из", base + "/v1/models")
