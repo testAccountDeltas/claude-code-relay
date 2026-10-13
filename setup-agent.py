@@ -1098,7 +1098,7 @@ def build_settings(default_model, models):
         "model": "opus",
         "fallbackModel": fb,
         "language": "Russia",
-        "effortLevel": "medium",
+        "effortLevel": "xhigh",
         "skipDangerousModePermissionPrompt": True,
     }
     return s, (high, med, low, extra)
