@@ -639,16 +639,37 @@ def _open_upstream(command, path, body, fh, rid, t0):
             _release(c, resp, ok=ok_read); attempt += 1; time.sleep(_backoff_sleep(attempt)); continue
         return c, resp
 
+# SSE keepalive ping: отправляется каждые 5.0 секунд тишины от апстрима Google.
+# Предотвращает разрыв соединения клиентом Claude Code (BrokenPipeError / ECONNRESET)
+# при длинных задержках генерации, очередях TPU или инфраструктурных спайках Google.
+_PING_INTERVAL = 5.0
+
 def _stream_one(conn, resp, wfile, offset, suppress_start, t0=None):
     """Стримит один ответ ЖИВЬЁМ, придерживая терминальные кадры; при offset>0
     переиндексирует content_block_*; при suppress_start глушит message_start."""
     st = {"saw_text": False, "saw_tool": False, "saw_thinking": False,
-          "thinking_chars": 0, "text_chars": 0, "tool_json_chars": 0,
+          "thinking_chars": 0, "text_chars": 0, "tool_json_chars": 0, "pings_sent": 0,
           "stop_reason": None, "max_index": -1, "held": [], "usage": None, "err": None,
           "tool_names": [], "tool_calls": [], "text_buf": "", "t_first": None, "t_content": None}
     buf = ""
     got_first_byte = False
     _tool_blocks = {}  # idx -> {"name": str, "json": str}  — накопление input_json_delta для детектора повторов
+
+    stop_heartbeat = threading.Event()
+    wfile_lock = threading.Lock()
+
+    def _heartbeat_worker():
+        while not stop_heartbeat.wait(_PING_INTERVAL):
+            with wfile_lock:
+                try:
+                    wfile.write(b"event: ping\ndata: {\"type\":\"ping\"}\n\n")
+                    wfile.flush()
+                    st["pings_sent"] += 1
+                except Exception:
+                    break
+
+    hb_thread = threading.Thread(target=_heartbeat_worker, daemon=True)
+    hb_thread.start()
     # Инкрементальный декодер: resp.read(8192) режет байты без учёта границ UTF-8 символа
     # (кириллица = 2 байта и т.п.). decode() на каждом куске ПО ОТДЕЛЬНОСТИ портит символ,
     # разрезанный между кусками, в "�" — инкрементальный декодер сам буферизует неполный хвост.
@@ -658,6 +679,7 @@ def _stream_one(conn, resp, wfile, offset, suppress_start, t0=None):
             chunk = resp.read(8192)
             if not got_first_byte and chunk:
                 got_first_byte = True
+                stop_heartbeat.set()  # первый байт пришёл -> останавливаем фоновый ping
                 if t0 is not None and st["t_first"] is None:
                     st["t_first"] = time.time() - t0
                 try: conn.sock.settimeout(_READ_TIMEOUT)  # первый байт пришёл -> снимаем короткий TTFT-таймаут
@@ -670,23 +692,25 @@ def _stream_one(conn, resp, wfile, offset, suppress_start, t0=None):
             for frame in frames:
                 if not frame.strip(): continue
                 typ, obj = _parse_frame(frame)
-                if typ is None: _write_raw(wfile, frame); continue
-                if typ == "message_start":
-                    if not suppress_start: _write_raw(wfile, frame)
-                    continue
-                if typ in ("content_block_start", "content_block_delta", "content_block_stop"):
-                    if t0 is not None and st["t_content"] is None:
-                        st["t_content"] = time.time() - t0
-                    idx = obj.get("index", 0)
-                    st["max_index"] = max(st["max_index"], idx + offset)
-                    if typ == "content_block_start":
-                        cb = obj.get("content_block") or {}
-                        bt = cb.get("type")
-                        if bt == "tool_use":
-                            st["saw_tool"] = True
-                            st["tool_names"].append(cb.get("name"))
-                            _tool_blocks[idx] = {"name": cb.get("name"), "json": ""}
-                        elif bt == "thinking": st["saw_thinking"] = True
+                with wfile_lock:
+                    if typ is None: _write_raw(wfile, frame); continue
+                    if typ == "message_start":
+                        if not suppress_start: _write_raw(wfile, frame)
+                        continue
+                    if typ in ("content_block_start", "content_block_delta", "content_block_stop"):
+                        if t0 is not None and st["t_content"] is None:
+                            st["t_content"] = time.time() - t0
+                        idx = obj.get("index", 0)
+                        st["max_index"] = max(st["max_index"], idx + offset)
+                        if typ == "content_block_start":
+                            cb = obj.get("content_block") or {}
+                            bt = cb.get("type")
+                            if bt == "tool_use":
+                                st["saw_tool"] = True
+                                st["tool_names"].append(cb.get("name"))
+                                _tool_blocks[idx] = {"name": cb.get("name"), "json": ""}
+                            elif bt == "thinking":
+                                st["saw_thinking"] = True
                     elif typ == "content_block_delta":
                         d = obj.get("delta") or {}
                         dtype = d.get("type")
@@ -711,15 +735,18 @@ def _stream_one(conn, resp, wfile, offset, suppress_start, t0=None):
                     if offset: obj["index"] = idx + offset; _write_frame_obj(wfile, obj)
                     else: _write_raw(wfile, frame)
                     continue
-                if typ == "message_delta":
-                    d = obj.get("delta") or {}
-                    if "stop_reason" in d: st["stop_reason"] = d.get("stop_reason")
-                    st["usage"] = obj.get("usage"); st["held"].append(frame); continue
-                if typ == "message_stop":
-                    st["held"].append(frame); continue
-                _write_raw(wfile, frame)
+                with wfile_lock:
+                    if typ == "message_delta":
+                        d = obj.get("delta") or {}
+                        if "stop_reason" in d: st["stop_reason"] = d.get("stop_reason")
+                        st["usage"] = obj.get("usage"); st["held"].append(frame); continue
+                    if typ == "message_stop":
+                        st["held"].append(frame); continue
+                    _write_raw(wfile, frame)
     except Exception as e:
         st["err"] = e
+    finally:
+        stop_heartbeat.set()
     return st
 
 _req_id_lock = threading.Lock()
@@ -847,9 +874,11 @@ class H(http.server.BaseHTTPRequestHandler):
             th_c = final_st.get("thinking_chars", 0) if final_st else 0
             tx_c = final_st.get("text_chars", 0) if final_st else 0
             tj_c = final_st.get("tool_json_chars", 0) if final_st else 0
+            pings = final_st.get("pings_sent", 0) if final_st else 0
             if th_c > 0: u_parts.append(f"think_chars={th_c}(~{th_c//4}tok)")
             if tx_c > 0: u_parts.append(f"text_chars={tx_c}")
             if tj_c > 0: u_parts.append(f"tool_chars={tj_c}")
+            if pings > 0: u_parts.append(f"pings={pings}")
             if u.get("input_tokens") is not None: u_parts.append(f"in_tok={u['input_tokens']}")
             if u.get("cache_read_input_tokens") is not None: u_parts.append(f"cache_read={u['cache_read_input_tokens']}")
             u_str = (", " + ", ".join(u_parts)) if u_parts else ""

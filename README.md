@@ -80,10 +80,18 @@ python setup-agent.py
 - Ставит **тихий фикс-прокси** (`~/.clirelay-agent/relay-proxy.py`): вырезает служебный
   system-блок `x-anthropic-billing-header`, из-за которого шлюз иначе отдаёт 429/503.
   Работает **без окна**, один на все сессии (проверяет порт, не плодит процессы).
-- Переводит `/effort` (low/medium/high/xhigh/max) в реальный бюджет мышления для шлюза —
-  он это поле иначе игнорирует. Шкала — нативные бюджеты agy (`low=2048, medium=8192,
-  high=16384, xhigh=32768, max=65536`); `low` не ниже 2048 — ниже этого Gemini 3.x
-  целиком обрывает цепочку рассуждений (эмпирически подтверждено).
+- **Динамический авто-тир (`*-tiered`) и нативный адаптивный режим**:
+  модели с суффиксом `-tiered` автоматически выбирают нужный бэкенд шлюза по команде
+  Claude Code `/effort`: `low` → `*-low(2048)`, `medium` → `*-medium(8192)`, `high` → `*-high(16384)`.
+  Уровень **`/effort xhigh`** (дефолт в `settings.json`) активирует чистый адаптивный режим Google
+  (`gemini-3.8-flash-tiered`, `ModeAuto`, `thinkingBudget = -1`) без искусственных скобок бюджета,
+  где модель сама динамически решает, когда и сколько рассуждать.
+- **SSE Ping Heartbeat (защита от BrokenPipeError / сокетных таймаутов)**:
+  каждые 5 секунд тишины от апстрима Google прокси отправляет клиенту стандартный Anthropic-кадр
+  `event: ping\ndata: {"type":"ping"}\n\n`. Это сбрасывает idle-таймаут сокета Claude Code во время
+  очередей Borg и спайков TPU Google (до 30–66с до первого токена) и полностью предотвращает разрыв сокета.
+- **Детальная телеметрия вывода**: логирует реальные символы текста (`text_chars`), рассуждений
+  (`think_chars` с оценкой токенов `~think_chars//4`), вызовов тулов (`tool_chars`) и число посланных пингов (`pings=N`).
 - Короткий таймаут на обрыв соединения (4с вместо дефолтных ~20с) + таймаут на первый
   байт ответа (60с, отдельно от 600с на весь стрим — мёртвый воркер шлюза не виснет
   на 10 минут) + экспоненциальный бэкофф с джиттером между попытками — обрыв не
@@ -198,6 +206,24 @@ regardless of the model's actual window size, so cleanup happens 3x earlier.
 `[agent-type=... request-class=subagent]`, если включён
 `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` (включён по умолчанию).
 
+## Динамический выбор моделей (`-tiered`) и нативный адаптивный режим (`xhigh`)
+
+В шлюзе Google Antigravity существуют два класса моделей:
+1. **Фиксированные тиры**: `*-low`, `*-medium`, `*-high` с фиксированными вычислительными квотами и бюджетами рассуждений.
+2. **Адаптивная модель**: `gemini-3.8-flash-tiered` — нативная модель Google с внутренним механизмом **Dynamic Compute Tiering**. Она сама оценивает сложность задачи и динамически выделяет TPU-ресурсы и объём рассуждений (`thoughtsTokenCount`).
+
+### Почему адаптивный режим вынесен на `/effort xhigh`?
+
+- В интерфейсе Claude Code шкала рассуждений имеет 4 основных уровня: `low`, `medium`, `high`, `xhigh`.
+- В нативном клиенте `agy CLI` есть только 3 фиксированных уровня (`Low`, `Medium`, `High`), которым точно соответствуют фиксированные модели `-low(2048)`, `-medium(8192)` и `-high(16384)`.
+- Если навязать адаптивной модели `gemini-3.8-flash-tiered` скобочный бюджет вроде `(16384)` или `(32768)`, в исходном коде шлюза (`clirelay-src`) отключается режим `ModeAuto` и модель принуждается генерировать избыточные рассуждения даже на элементарных шагах.
+- **Архитектурное решение**:
+  - `low` $\rightarrow$ переключает запрос на бэкенд `*-low(2048)`
+  - `medium` $\rightarrow$ переключает запрос на бэкенд `*-medium(8192)`
+  - `high` $\rightarrow$ переключает запрос на бэкенд `*-high(16384)`
+  - **`xhigh` / `max`** $\rightarrow$ оставляет модель чистой (`gemini-3.8-flash-tiered` без скобок). Шлюз видит чистую модель и включает флаг **`ModeAuto` (`thinkingBudget = -1`)**.
+- **Результат**: на уровне `xhigh` модель не тратит лишние рассуждения на рутинные чтения файлов (`think_chars = 0`), но мгновенно разворачивает глубокий анализ на сложной архитектурной логике. Этот режим установлен **по умолчанию** в конфигурации агента.
+
 ## Switching models in-session
 
 The three built-in picker slots are remapped to your gateway's models via
@@ -205,12 +231,12 @@ The three built-in picker slots are remapped to your gateway's models via
 `ANTHROPIC_CUSTOM_MODEL_OPTION`), so the `/model` picker shows **your models by name**
 and you switch between them **without restarting**:
 
-| `/model` entry | your model |
-|---|---|
-| **Opus**   | `<model>-high`     |
-| **Sonnet** | your default model (the picker default) |
-| **Haiku**  | `<model>-low`      |
-| extra      | a `pro` model if your gateway has one |
+| `/model` entry | your model | режим мышления по умолчанию |
+|---|---|---|
+| **Opus**   | `gemini-3.8-flash-tiered` | Динамический авто-тир (`xhigh` $\rightarrow$ ModeAuto) |
+| **Sonnet** | `gemini-3.8-flash-medium` | Фиксированный тир (8192) |
+| **Haiku**  | `gemini-3.8-flash-low`    | Фиксированный тир (2048) |
+| extra      | `gemini-2.5-pro`          | Pro-модель |
 
 Any other model: `/model → Custom →` type the id (see `<gateway>/v1/models`).
 Edit the mapping in `~/.clirelay-agent/claude-home/settings.json` → `env` →
